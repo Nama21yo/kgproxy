@@ -1,0 +1,8 @@
+/app/target/
+/.env
+/.env.*
+!/.env.example
+/redis_data/
+/pg_data/
+dump.rdb
+*.log

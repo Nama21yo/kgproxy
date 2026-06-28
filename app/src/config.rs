@@ -1,0 +1,87 @@
+use std::{env, net::SocketAddr, time::Duration};
+
+use thiserror::Error;
+
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+const DEFAULT_DBPEDIA_SPARQL_URL: &str = "https://dbpedia.org/sparql";
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 604_800;
+const DEFAULT_MAX_OUTBOUND_CONCURRENCY: usize = 2;
+const DEFAULT_ORIGIN_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_MAX_ORIGIN_RESPONSE_BYTES: usize = 100 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub bind_addr: SocketAddr,
+    pub dbpedia_sparql_url: String,
+    pub cache_ttl: Duration,
+    pub max_outbound_concurrency: usize,
+    pub origin_timeout: Duration,
+    pub max_origin_response_bytes: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("invalid {name}: {value}")]
+    InvalidValue { name: &'static str, value: String },
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let bind_addr = parse_env(
+            "BIND_ADDR",
+            DEFAULT_BIND_ADDR
+                .parse()
+                .expect("default bind address must be valid"),
+        )?;
+        let dbpedia_sparql_url = env::var("DBPEDIA_SPARQL_URL")
+            .unwrap_or_else(|_| DEFAULT_DBPEDIA_SPARQL_URL.to_owned());
+        let cache_ttl =
+            Duration::from_secs(parse_env("CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL_SECONDS)?);
+        let max_outbound_concurrency =
+            parse_env("MAX_OUTBOUND_CONCURRENCY", DEFAULT_MAX_OUTBOUND_CONCURRENCY)?;
+        let origin_timeout =
+            Duration::from_millis(parse_env("ORIGIN_TIMEOUT_MS", DEFAULT_ORIGIN_TIMEOUT_MS)?);
+        let max_origin_response_bytes = parse_env(
+            "MAX_ORIGIN_RESPONSE_BYTES",
+            DEFAULT_MAX_ORIGIN_RESPONSE_BYTES,
+        )?;
+
+        Ok(Self {
+            bind_addr,
+            dbpedia_sparql_url,
+            cache_ttl,
+            max_outbound_concurrency,
+            origin_timeout,
+            max_origin_response_bytes,
+        })
+    }
+}
+
+fn parse_env<T>(name: &'static str, default: T) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr,
+{
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue { name, value }),
+        Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults_match_mvp_capacity_plan() {
+        let config = Config::from_env().expect("default config should load");
+
+        assert_eq!(config.bind_addr, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(config.dbpedia_sparql_url, "https://dbpedia.org/sparql");
+        assert_eq!(config.cache_ttl, Duration::from_secs(604_800));
+        assert_eq!(config.max_outbound_concurrency, 2);
+        assert_eq!(config.origin_timeout, Duration::from_millis(2_000));
+        assert_eq!(config.max_origin_response_bytes, 100 * 1024);
+    }
+}
