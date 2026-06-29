@@ -42,6 +42,7 @@ pub enum CacheError {
 #[async_trait]
 pub trait ResponseCache: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<CachedEntry>, CacheError>;
+    async fn get_stale(&self, key: &str) -> Result<Option<CachedEntry>, CacheError>;
     async fn set(&self, key: &str, entry: &CachedEntry, ttl: Duration) -> Result<(), CacheError>;
 }
 
@@ -69,13 +70,29 @@ impl ResponseCache for RedisCache {
             .transpose()
     }
 
+    async fn get_stale(&self, key: &str) -> Result<Option<CachedEntry>, CacheError> {
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let value: Option<String> = connection.get(stale_key(key)).await?;
+
+        value
+            .map(|serialized| serde_json::from_str(&serialized).map_err(CacheError::from))
+            .transpose()
+    }
+
     async fn set(&self, key: &str, entry: &CachedEntry, ttl: Duration) -> Result<(), CacheError> {
         let mut connection = self.client.get_multiplexed_async_connection().await?;
         let serialized = serde_json::to_string(entry)?;
         let _: () = connection.set_ex(key, serialized, ttl.as_secs()).await?;
+        let _: () = connection
+            .set(stale_key(key), serde_json::to_string(entry)?)
+            .await?;
 
         Ok(())
     }
+}
+
+fn stale_key(key: &str) -> String {
+    format!("stale:{key}")
 }
 
 fn now_unix_secs() -> u64 {

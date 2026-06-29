@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 use crate::{
     cache::{CachedEntry, ResponseCache},
     cache_key,
+    circuit_breaker::{BreakerState, CircuitBreaker},
     origin::{DbpediaClient, OriginError},
 };
 
@@ -24,6 +25,7 @@ pub struct AppState {
     cache_ttl: Duration,
     outbound_limiter: Arc<Semaphore>,
     max_outbound_concurrency: usize,
+    breaker: Arc<CircuitBreaker>,
 }
 
 impl AppState {
@@ -33,12 +35,29 @@ impl AppState {
         cache_ttl: Duration,
         max_outbound_concurrency: usize,
     ) -> Self {
+        Self::with_breaker(
+            origin,
+            cache,
+            cache_ttl,
+            max_outbound_concurrency,
+            Arc::new(CircuitBreaker::new(3, Duration::from_secs(30))),
+        )
+    }
+
+    pub fn with_breaker(
+        origin: Arc<dyn DbpediaClient>,
+        cache: Arc<dyn ResponseCache>,
+        cache_ttl: Duration,
+        max_outbound_concurrency: usize,
+        breaker: Arc<CircuitBreaker>,
+    ) -> Self {
         Self {
             origin,
             cache,
             cache_ttl,
             outbound_limiter: Arc::new(Semaphore::new(max_outbound_concurrency)),
             max_outbound_concurrency,
+            breaker,
         }
     }
 }
@@ -49,6 +68,9 @@ struct HealthResponse {
     service: &'static str,
     outbound_available_permits: usize,
     max_outbound_concurrency: usize,
+    circuit_breaker_state: &'static str,
+    circuit_breaker_failures: u32,
+    last_successful_origin_call_unix_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +108,8 @@ enum ApiError {
     BadRequest(String),
     #[error("outbound limiter is closed")]
     OutboundLimiterClosed,
+    #[error("dbpedia origin is unavailable and no cached response exists")]
+    OriginUnavailable,
     #[error(transparent)]
     Origin(#[from] OriginError),
 }
@@ -100,11 +124,16 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let breaker = state.breaker.snapshot().await;
+
     Json(HealthResponse {
         status: "ok",
         service: "kgproxy",
         outbound_available_permits: state.outbound_limiter.available_permits(),
         max_outbound_concurrency: state.max_outbound_concurrency,
+        circuit_breaker_state: breaker.state.as_str(),
+        circuit_breaker_failures: breaker.failure_count,
+        last_successful_origin_call_unix_secs: breaker.last_success_unix_secs,
     })
 }
 
@@ -119,15 +148,24 @@ async fn entity(
         return Ok(Json(envelope));
     }
 
+    if state.breaker.before_request().await == BreakerState::Open {
+        return stale_or_unavailable(&state, &cache_key).await.map(Json);
+    }
+
     let _permit = state
         .outbound_limiter
         .acquire()
         .await
         .map_err(|_| ApiError::OutboundLimiterClosed)?;
-    let data = state.origin.entity(&id).await?;
-    store_fresh(&state, &cache_key, data.clone()).await;
 
-    Ok(Json(origin_envelope(data)))
+    match state.origin.entity(&id).await {
+        Ok(data) => {
+            state.breaker.record_success().await;
+            store_fresh(&state, &cache_key, data.clone()).await;
+            Ok(Json(origin_envelope(data)))
+        }
+        Err(error) => origin_failure(&state, &cache_key, error).await.map(Json),
+    }
 }
 
 async fn search(
@@ -141,15 +179,24 @@ async fn search(
         return Ok(Json(envelope));
     }
 
+    if state.breaker.before_request().await == BreakerState::Open {
+        return stale_or_unavailable(&state, &cache_key).await.map(Json);
+    }
+
     let _permit = state
         .outbound_limiter
         .acquire()
         .await
         .map_err(|_| ApiError::OutboundLimiterClosed)?;
-    let data = state.origin.search(&query).await?;
-    store_fresh(&state, &cache_key, data.clone()).await;
 
-    Ok(Json(origin_envelope(data)))
+    match state.origin.search(&query).await {
+        Ok(data) => {
+            state.breaker.record_success().await;
+            store_fresh(&state, &cache_key, data.clone()).await;
+            Ok(Json(origin_envelope(data)))
+        }
+        Err(error) => origin_failure(&state, &cache_key, error).await.map(Json),
+    }
 }
 
 async fn sparql(
@@ -163,15 +210,24 @@ async fn sparql(
         return Ok(Json(envelope));
     }
 
+    if state.breaker.before_request().await == BreakerState::Open {
+        return stale_or_unavailable(&state, &cache_key).await.map(Json);
+    }
+
     let _permit = state
         .outbound_limiter
         .acquire()
         .await
         .map_err(|_| ApiError::OutboundLimiterClosed)?;
-    let data = state.origin.sparql(&query).await?;
-    store_fresh(&state, &cache_key, data.clone()).await;
 
-    Ok(Json(origin_envelope(data)))
+    match state.origin.sparql(&query).await {
+        Ok(data) => {
+            state.breaker.record_success().await;
+            store_fresh(&state, &cache_key, data.clone()).await;
+            Ok(Json(origin_envelope(data)))
+        }
+        Err(error) => origin_failure(&state, &cache_key, error).await.map(Json),
+    }
 }
 
 fn validate_non_empty(value: String, field: &'static str) -> Result<String, ApiError> {
@@ -201,6 +257,15 @@ fn cache_envelope(data: Value) -> ApiEnvelope {
     }
 }
 
+fn stale_envelope(data: Value) -> ApiEnvelope {
+    ApiEnvelope {
+        data,
+        cached: true,
+        stale: true,
+        source: "stale_cache",
+    }
+}
+
 async fn cached_envelope(state: &AppState, key: &str) -> Option<ApiEnvelope> {
     let mut entry = match state.cache.get(key).await {
         Ok(Some(entry)) => entry,
@@ -212,6 +277,26 @@ async fn cached_envelope(state: &AppState, key: &str) -> Option<ApiEnvelope> {
     let _ = state.cache.set(key, &entry, state.cache_ttl).await;
 
     Some(cache_envelope(payload))
+}
+
+async fn stale_or_unavailable(state: &AppState, key: &str) -> Result<ApiEnvelope, ApiError> {
+    match state.cache.get_stale(key).await {
+        Ok(Some(entry)) => Ok(stale_envelope(entry.payload)),
+        Ok(None) | Err(_) => Err(ApiError::OriginUnavailable),
+    }
+}
+
+async fn origin_failure(
+    state: &AppState,
+    key: &str,
+    error: OriginError,
+) -> Result<ApiEnvelope, ApiError> {
+    state.breaker.record_failure().await;
+
+    match state.cache.get_stale(key).await {
+        Ok(Some(entry)) => Ok(stale_envelope(entry.payload)),
+        Ok(None) | Err(_) => Err(ApiError::Origin(error)),
+    }
 }
 
 async fn store_fresh(state: &AppState, key: &str, data: Value) {
@@ -226,6 +311,11 @@ impl IntoResponse for ApiError {
             Self::OutboundLimiterClosed => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "outbound_limiter_closed",
+                self.to_string(),
+            ),
+            Self::OriginUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "origin_unavailable",
                 self.to_string(),
             ),
             Self::Origin(error) => (StatusCode::BAD_GATEWAY, "origin_error", error.to_string()),
@@ -250,12 +340,13 @@ mod tests {
         http::{Request, StatusCode},
     };
     use http_body_util::BodyExt;
+    use reqwest::StatusCode as ReqwestStatusCode;
     use serde_json::json;
     use std::{
         collections::HashMap,
         sync::{
             Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
     use tokio::time::sleep;
@@ -267,19 +358,25 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         delay: Duration,
+        fail: AtomicBool,
     }
 
     impl MockOrigin {
         fn with_delay(delay: Duration) -> Self {
             Self {
-                calls: AtomicUsize::new(0),
-                active: AtomicUsize::new(0),
-                max_active: AtomicUsize::new(0),
                 delay,
+                ..Self::default()
             }
         }
 
-        async fn track_call(&self) {
+        fn failing() -> Self {
+            Self {
+                fail: AtomicBool::new(true),
+                ..Self::default()
+            }
+        }
+
+        async fn track_call(&self) -> Result<(), OriginError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
@@ -289,23 +386,29 @@ mod tests {
             }
 
             self.active.fetch_sub(1, Ordering::SeqCst);
+
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(OriginError::Status(ReqwestStatusCode::BAD_GATEWAY));
+            }
+
+            Ok(())
         }
     }
 
     #[async_trait]
     impl DbpediaClient for MockOrigin {
         async fn entity(&self, id: &str) -> Result<Value, OriginError> {
-            self.track_call().await;
+            self.track_call().await?;
             Ok(json!({ "kind": "entity", "id": id }))
         }
 
         async fn search(&self, query: &str) -> Result<Value, OriginError> {
-            self.track_call().await;
+            self.track_call().await?;
             Ok(json!({ "kind": "search", "query": query }))
         }
 
         async fn sparql(&self, query: &str) -> Result<Value, OriginError> {
-            self.track_call().await;
+            self.track_call().await?;
             Ok(json!({ "kind": "sparql", "query": query }))
         }
     }
@@ -313,12 +416,20 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryCache {
         entries: Mutex<HashMap<String, CachedEntry>>,
+        stale_entries: Mutex<HashMap<String, CachedEntry>>,
     }
 
     #[async_trait]
     impl ResponseCache for MemoryCache {
         async fn get(&self, key: &str) -> Result<Option<CachedEntry>, crate::cache::CacheError> {
             Ok(self.entries.lock().unwrap().get(key).cloned())
+        }
+
+        async fn get_stale(
+            &self,
+            key: &str,
+        ) -> Result<Option<CachedEntry>, crate::cache::CacheError> {
+            Ok(self.stale_entries.lock().unwrap().get(key).cloned())
         }
 
         async fn set(
@@ -331,7 +442,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(key.to_owned(), entry.clone());
+            self.stale_entries
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), entry.clone());
             Ok(())
+        }
+    }
+
+    impl MemoryCache {
+        fn expire_fresh(&self, key: &str) {
+            self.entries.lock().unwrap().remove(key);
         }
     }
 
@@ -359,6 +480,14 @@ mod tests {
         )
     }
 
+    fn test_state_with_breaker(
+        origin: Arc<MockOrigin>,
+        cache: Arc<MemoryCache>,
+        breaker: Arc<CircuitBreaker>,
+    ) -> AppState {
+        AppState::with_breaker(origin, cache, Duration::from_secs(604_800), 2, breaker)
+    }
+
     #[tokio::test]
     async fn health_route_returns_ok() {
         let response = test_router()
@@ -379,6 +508,7 @@ mod tests {
         assert_eq!(json["service"], "kgproxy");
         assert_eq!(json["outbound_available_permits"], 2);
         assert_eq!(json["max_outbound_concurrency"], 2);
+        assert_eq!(json["circuit_breaker_state"], "closed");
     }
 
     #[tokio::test]
@@ -607,6 +737,93 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn origin_failure_serves_stale_cached_response() {
+        let origin = Arc::new(MockOrigin::failing());
+        let cache = Arc::new(MemoryCache::default());
+        let key = cache_key::entity_key("Albert_Einstein", &[("lang", "en")]);
+        cache
+            .set(
+                &key,
+                &CachedEntry::fresh(json!({ "kind": "stale-entity" })),
+                Duration::from_secs(604_800),
+            )
+            .await
+            .unwrap();
+        cache.expire_fresh(&key);
+
+        let response = build_router(test_state(origin, cache))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/entity/Albert_Einstein")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["data"]["kind"], "stale-entity");
+        assert_eq!(json["stale"], true);
+        assert_eq!(json["source"], "stale_cache");
+    }
+
+    #[tokio::test]
+    async fn open_breaker_serves_stale_without_forwarding_origin_call() {
+        let origin = Arc::new(MockOrigin::default());
+        let cache = Arc::new(MemoryCache::default());
+        let breaker = Arc::new(CircuitBreaker::new(1, Duration::from_secs(30)));
+        breaker.record_failure().await;
+        let key = cache_key::entity_key("Albert_Einstein", &[("lang", "en")]);
+        cache
+            .set(
+                &key,
+                &CachedEntry::fresh(json!({ "kind": "stale-entity" })),
+                Duration::from_secs(604_800),
+            )
+            .await
+            .unwrap();
+        cache.expire_fresh(&key);
+
+        let response = build_router(test_state_with_breaker(origin.clone(), cache, breaker))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/entity/Albert_Einstein")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["stale"], true);
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn open_breaker_without_cache_returns_unavailable_error() {
+        let origin = Arc::new(MockOrigin::default());
+        let cache = Arc::new(MemoryCache::default());
+        let breaker = Arc::new(CircuitBreaker::new(1, Duration::from_secs(30)));
+        breaker.record_failure().await;
+
+        let response = build_router(test_state_with_breaker(origin, cache, breaker))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/entity/Albert_Einstein")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["code"], "origin_unavailable");
     }
 
     async fn request_json(request: Request<Body>) -> Value {

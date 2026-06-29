@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod cache_key;
+pub mod circuit_breaker;
 pub mod config;
 pub mod http;
 pub mod origin;
