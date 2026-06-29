@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let cache = RedisCache::new(&config.redis_url)?;
     let postgres = postgres_pool(&config.database_url)?;
+    sqlx::migrate!("./migrations").run(&postgres).await?;
     let logger = ChannelLogger::spawn(postgres.clone(), 1024);
     let metrics = PostgresMetricsReader::new(postgres);
     let listener = TcpListener::bind(config.bind_addr).await?;
