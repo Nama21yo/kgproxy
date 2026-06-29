@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -10,16 +10,30 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::origin::{DbpediaClient, OriginError};
+use crate::{
+    cache::{CachedEntry, ResponseCache},
+    cache_key,
+    origin::{DbpediaClient, OriginError},
+};
 
 #[derive(Clone)]
 pub struct AppState {
     origin: Arc<dyn DbpediaClient>,
+    cache: Arc<dyn ResponseCache>,
+    cache_ttl: Duration,
 }
 
 impl AppState {
-    pub fn new(origin: Arc<dyn DbpediaClient>) -> Self {
-        Self { origin }
+    pub fn new(
+        origin: Arc<dyn DbpediaClient>,
+        cache: Arc<dyn ResponseCache>,
+        cache_ttl: Duration,
+    ) -> Self {
+        Self {
+            origin,
+            cache,
+            cache_ttl,
+        }
     }
 }
 
@@ -87,7 +101,14 @@ async fn entity(
     Path(id): Path<String>,
 ) -> Result<Json<ApiEnvelope>, ApiError> {
     let id = validate_non_empty(id, "entity id")?;
+    let cache_key = cache_key::entity_key(&id, &[("lang", "en")]);
+
+    if let Some(envelope) = cached_envelope(&state, &cache_key).await {
+        return Ok(Json(envelope));
+    }
+
     let data = state.origin.entity(&id).await?;
+    store_fresh(&state, &cache_key, data.clone()).await;
 
     Ok(Json(origin_envelope(data)))
 }
@@ -97,7 +118,14 @@ async fn search(
     Query(params): Query<SearchParams>,
 ) -> Result<Json<ApiEnvelope>, ApiError> {
     let query = validate_non_empty(params.q, "search query")?;
+    let cache_key = cache_key::search_key(&query, &[("lang", "en")]);
+
+    if let Some(envelope) = cached_envelope(&state, &cache_key).await {
+        return Ok(Json(envelope));
+    }
+
     let data = state.origin.search(&query).await?;
+    store_fresh(&state, &cache_key, data.clone()).await;
 
     Ok(Json(origin_envelope(data)))
 }
@@ -107,7 +135,14 @@ async fn sparql(
     Json(body): Json<SparqlRequest>,
 ) -> Result<Json<ApiEnvelope>, ApiError> {
     let query = validate_non_empty(body.query, "sparql query")?;
+    let cache_key = cache_key::sparql_key(&query);
+
+    if let Some(envelope) = cached_envelope(&state, &cache_key).await {
+        return Ok(Json(envelope));
+    }
+
     let data = state.origin.sparql(&query).await?;
+    store_fresh(&state, &cache_key, data.clone()).await;
 
     Ok(Json(origin_envelope(data)))
 }
@@ -128,6 +163,33 @@ fn origin_envelope(data: Value) -> ApiEnvelope {
         stale: false,
         source: "origin",
     }
+}
+
+fn cache_envelope(data: Value) -> ApiEnvelope {
+    ApiEnvelope {
+        data,
+        cached: true,
+        stale: false,
+        source: "cache",
+    }
+}
+
+async fn cached_envelope(state: &AppState, key: &str) -> Option<ApiEnvelope> {
+    let mut entry = match state.cache.get(key).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) | Err(_) => return None,
+    };
+
+    entry.record_hit();
+    let payload = entry.payload.clone();
+    let _ = state.cache.set(key, &entry, state.cache_ttl).await;
+
+    Some(cache_envelope(payload))
+}
+
+async fn store_fresh(state: &AppState, key: &str, data: Value) {
+    let entry = CachedEntry::fresh(data);
+    let _ = state.cache.set(key, &entry, state.cache_ttl).await;
 }
 
 impl IntoResponse for ApiError {
@@ -157,28 +219,72 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use serde_json::json;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
     use tower::ServiceExt;
 
     #[derive(Debug, Default)]
-    struct MockOrigin;
+    struct MockOrigin {
+        calls: AtomicUsize,
+    }
 
     #[async_trait]
     impl DbpediaClient for MockOrigin {
         async fn entity(&self, id: &str) -> Result<Value, OriginError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(json!({ "kind": "entity", "id": id }))
         }
 
         async fn search(&self, query: &str) -> Result<Value, OriginError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(json!({ "kind": "search", "query": query }))
         }
 
         async fn sparql(&self, query: &str) -> Result<Value, OriginError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(json!({ "kind": "sparql", "query": query }))
         }
     }
 
+    #[derive(Debug, Default)]
+    struct MemoryCache {
+        entries: Mutex<HashMap<String, CachedEntry>>,
+    }
+
+    #[async_trait]
+    impl ResponseCache for MemoryCache {
+        async fn get(&self, key: &str) -> Result<Option<CachedEntry>, crate::cache::CacheError> {
+            Ok(self.entries.lock().unwrap().get(key).cloned())
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            entry: &CachedEntry,
+            _ttl: Duration,
+        ) -> Result<(), crate::cache::CacheError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), entry.clone());
+            Ok(())
+        }
+    }
+
     fn test_router() -> Router {
-        build_router(AppState::new(Arc::new(MockOrigin)))
+        build_router(test_state(
+            Arc::new(MockOrigin::default()),
+            Arc::new(MemoryCache::default()),
+        ))
+    }
+
+    fn test_state(origin: Arc<MockOrigin>, cache: Arc<MemoryCache>) -> AppState {
+        AppState::new(origin, cache, Duration::from_secs(604_800))
     }
 
     #[tokio::test]
@@ -195,8 +301,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let json = body_json(response).await;
 
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "kgproxy");
@@ -286,6 +391,64 @@ mod tests {
 
         assert_eq!(json["data"]["kind"], "sparql");
         assert_eq!(json["data"]["query"], "SELECT * WHERE { ?s ?p ?o } LIMIT 1");
+    }
+
+    #[tokio::test]
+    async fn cache_hit_returns_data_without_origin_call() {
+        let origin = Arc::new(MockOrigin::default());
+        let cache = Arc::new(MemoryCache::default());
+        let key = cache_key::entity_key("Albert_Einstein", &[("lang", "en")]);
+        cache
+            .set(
+                &key,
+                &CachedEntry::fresh(json!({ "kind": "cached-entity" })),
+                Duration::from_secs(604_800),
+            )
+            .await
+            .unwrap();
+
+        let response = build_router(test_state(origin.clone(), cache))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/entity/Albert_Einstein")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["data"]["kind"], "cached-entity");
+        assert_eq!(json["cached"], true);
+        assert_eq!(json["source"], "cache");
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_miss_calls_origin_once_and_stores_response() {
+        let origin = Arc::new(MockOrigin::default());
+        let cache = Arc::new(MemoryCache::default());
+        let key = cache_key::search_key("Albert Einstein", &[("lang", "en")]);
+
+        let response = build_router(test_state(origin.clone(), cache.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/search?q=Albert%20Einstein")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["cached"], false);
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
+
+        let stored = cache.get(&key).await.unwrap().unwrap();
+        assert_eq!(stored.payload["kind"], "search");
+        assert_eq!(stored.hit_count, 0);
     }
 
     async fn request_json(request: Request<Body>) -> Value {

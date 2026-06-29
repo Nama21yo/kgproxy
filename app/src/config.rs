@@ -4,6 +4,7 @@ use thiserror::Error;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_DBPEDIA_SPARQL_URL: &str = "https://dbpedia.org/sparql";
+const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379/0";
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 604_800;
 const DEFAULT_MAX_OUTBOUND_CONCURRENCY: usize = 2;
 const DEFAULT_ORIGIN_TIMEOUT_MS: u64 = 2_000;
@@ -13,6 +14,7 @@ const DEFAULT_MAX_ORIGIN_RESPONSE_BYTES: usize = 100 * 1024;
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub dbpedia_sparql_url: String,
+    pub redis_url: String,
     pub cache_ttl: Duration,
     pub max_outbound_concurrency: usize,
     pub origin_timeout: Duration,
@@ -35,6 +37,7 @@ impl Config {
         )?;
         let dbpedia_sparql_url = env::var("DBPEDIA_SPARQL_URL")
             .unwrap_or_else(|_| DEFAULT_DBPEDIA_SPARQL_URL.to_owned());
+        let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.to_owned());
         let cache_ttl =
             Duration::from_secs(parse_env("CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL_SECONDS)?);
         let max_outbound_concurrency =
@@ -49,6 +52,7 @@ impl Config {
         Ok(Self {
             bind_addr,
             dbpedia_sparql_url,
+            redis_url,
             cache_ttl,
             max_outbound_concurrency,
             origin_timeout,
@@ -79,6 +83,7 @@ mod tests {
 
         assert_eq!(config.bind_addr, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(config.dbpedia_sparql_url, "https://dbpedia.org/sparql");
+        assert_eq!(config.redis_url, "redis://127.0.0.1:6379/0");
         assert_eq!(config.cache_ttl, Duration::from_secs(604_800));
         assert_eq!(config.max_outbound_concurrency, 2);
         assert_eq!(config.origin_timeout, Duration::from_millis(2_000));
