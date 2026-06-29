@@ -3,8 +3,9 @@ use std::sync::Arc;
 use kgproxy::{
     cache::RedisCache,
     config::Config,
-    http::{build_router, AppState},
-    logging::{postgres_pool, ChannelLogger},
+    http::{AppState, build_router},
+    logging::{ChannelLogger, postgres_pool},
+    metrics::PostgresMetricsReader,
     origin::ReqwestDbpediaClient,
 };
 use tokio::net::TcpListener;
@@ -25,18 +26,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_origin_response_bytes,
     )?;
     let cache = RedisCache::new(&config.redis_url)?;
-    let logger = ChannelLogger::spawn(postgres_pool(&config.database_url)?, 1024);
+    let postgres = postgres_pool(&config.database_url)?;
+    let logger = ChannelLogger::spawn(postgres.clone(), 1024);
+    let metrics = PostgresMetricsReader::new(postgres);
     let listener = TcpListener::bind(config.bind_addr).await?;
 
     tracing::info!(addr = %listener.local_addr()?, "kgproxy listening");
     axum::serve(
         listener,
-        build_router(AppState::new(
+        build_router(AppState::with_metrics(
             Arc::new(origin),
             Arc::new(cache),
             config.cache_ttl,
             config.max_outbound_concurrency,
             Arc::new(logger),
+            Arc::new(metrics),
         )),
     )
     .await?;

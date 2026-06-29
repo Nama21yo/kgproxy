@@ -4,11 +4,11 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +19,7 @@ use crate::{
     cache_key,
     circuit_breaker::{BreakerState, CircuitBreaker},
     logging::{RequestLogEvent, RequestLogger},
+    metrics::{EmptyMetricsReader, MetricsReader, MetricsSummary},
     origin::{DbpediaClient, OriginError},
 };
 
@@ -31,6 +32,7 @@ pub struct AppState {
     max_outbound_concurrency: usize,
     breaker: Arc<CircuitBreaker>,
     logger: Arc<dyn RequestLogger>,
+    metrics: Arc<dyn MetricsReader>,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
             max_outbound_concurrency,
             Arc::new(CircuitBreaker::new(3, Duration::from_secs(30))),
             logger,
+            Arc::new(EmptyMetricsReader),
         )
     }
 
@@ -58,6 +61,7 @@ impl AppState {
         max_outbound_concurrency: usize,
         breaker: Arc<CircuitBreaker>,
         logger: Arc<dyn RequestLogger>,
+        metrics: Arc<dyn MetricsReader>,
     ) -> Self {
         Self {
             origin,
@@ -67,7 +71,27 @@ impl AppState {
             max_outbound_concurrency,
             breaker,
             logger,
+            metrics,
         }
+    }
+
+    pub fn with_metrics(
+        origin: Arc<dyn DbpediaClient>,
+        cache: Arc<dyn ResponseCache>,
+        cache_ttl: Duration,
+        max_outbound_concurrency: usize,
+        logger: Arc<dyn RequestLogger>,
+        metrics: Arc<dyn MetricsReader>,
+    ) -> Self {
+        Self::with_breaker(
+            origin,
+            cache,
+            cache_ttl,
+            max_outbound_concurrency,
+            Arc::new(CircuitBreaker::new(3, Duration::from_secs(30))),
+            logger,
+            metrics,
+        )
     }
 }
 
@@ -120,6 +144,8 @@ enum ApiError {
     #[error("dbpedia origin is unavailable and no cached response exists")]
     OriginUnavailable,
     #[error(transparent)]
+    Metrics(#[from] crate::metrics::MetricsError),
+    #[error(transparent)]
     Origin(#[from] OriginError),
 }
 
@@ -129,6 +155,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/entity/:id", get(entity))
         .route("/v1/search", get(search))
         .route("/v1/sparql", post(sparql))
+        .route("/v1/metrics/summary", get(metrics_summary))
         .with_state(state)
 }
 
@@ -144,6 +171,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         circuit_breaker_failures: breaker.failure_count,
         last_successful_origin_call_unix_secs: breaker.last_success_unix_secs,
     })
+}
+
+async fn metrics_summary(State(state): State<AppState>) -> Result<Json<MetricsSummary>, ApiError> {
+    Ok(Json(state.metrics.summary(86_400).await?))
 }
 
 async fn entity(
@@ -504,6 +535,11 @@ impl IntoResponse for ApiError {
                 "origin_unavailable",
                 self.to_string(),
             ),
+            Self::Metrics(error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "metrics_unavailable",
+                error.to_string(),
+            ),
             Self::Origin(error) => (StatusCode::BAD_GATEWAY, "origin_error", error.to_string()),
         };
 
@@ -524,6 +560,7 @@ impl ApiError {
             Self::OutboundLimiterClosed | Self::OriginUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Self::Metrics(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Origin(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -544,8 +581,8 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
     use tokio::time::sleep;
@@ -704,6 +741,7 @@ mod tests {
             2,
             breaker,
             Arc::new(NoopLogger),
+            Arc::new(EmptyMetricsReader),
         )
     }
 
@@ -719,6 +757,7 @@ mod tests {
             2,
             Arc::new(CircuitBreaker::new(3, Duration::from_secs(30))),
             logger,
+            Arc::new(EmptyMetricsReader),
         )
     }
 
@@ -743,6 +782,26 @@ mod tests {
         assert_eq!(json["outbound_available_permits"], 2);
         assert_eq!(json["max_outbound_concurrency"], 2);
         assert_eq!(json["circuit_breaker_state"], "closed");
+    }
+
+    #[tokio::test]
+    async fn metrics_summary_route_returns_empty_default_summary() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = body_json(response).await;
+        assert_eq!(json["rolling_window_seconds"], 86_400);
+        assert_eq!(json["total_requests"], 0);
+        assert_eq!(json["cache_hit_rate"], 0.0);
     }
 
     #[tokio::test]
