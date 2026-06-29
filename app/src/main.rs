@@ -4,6 +4,7 @@ use kgproxy::{
     cache::RedisCache,
     config::Config,
     http::{AppState, build_router},
+    logging::{ChannelLogger, postgres_pool},
     origin::ReqwestDbpediaClient,
 };
 use tokio::net::TcpListener;
@@ -24,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_origin_response_bytes,
     )?;
     let cache = RedisCache::new(&config.redis_url)?;
+    let logger = ChannelLogger::spawn(postgres_pool(&config.database_url)?, 1024);
     let listener = TcpListener::bind(config.bind_addr).await?;
 
     tracing::info!(addr = %listener.local_addr()?, "kgproxy listening");
@@ -34,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(cache),
             config.cache_ttl,
             config.max_outbound_concurrency,
+            Arc::new(logger),
         )),
     )
     .await?;

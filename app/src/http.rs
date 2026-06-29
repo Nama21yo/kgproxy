@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -15,6 +18,7 @@ use crate::{
     cache::{CachedEntry, ResponseCache},
     cache_key,
     circuit_breaker::{BreakerState, CircuitBreaker},
+    logging::{RequestLogEvent, RequestLogger},
     origin::{DbpediaClient, OriginError},
 };
 
@@ -26,6 +30,7 @@ pub struct AppState {
     outbound_limiter: Arc<Semaphore>,
     max_outbound_concurrency: usize,
     breaker: Arc<CircuitBreaker>,
+    logger: Arc<dyn RequestLogger>,
 }
 
 impl AppState {
@@ -34,6 +39,7 @@ impl AppState {
         cache: Arc<dyn ResponseCache>,
         cache_ttl: Duration,
         max_outbound_concurrency: usize,
+        logger: Arc<dyn RequestLogger>,
     ) -> Self {
         Self::with_breaker(
             origin,
@@ -41,6 +47,7 @@ impl AppState {
             cache_ttl,
             max_outbound_concurrency,
             Arc::new(CircuitBreaker::new(3, Duration::from_secs(30))),
+            logger,
         )
     }
 
@@ -50,6 +57,7 @@ impl AppState {
         cache_ttl: Duration,
         max_outbound_concurrency: usize,
         breaker: Arc<CircuitBreaker>,
+        logger: Arc<dyn RequestLogger>,
     ) -> Self {
         Self {
             origin,
@@ -58,6 +66,7 @@ impl AppState {
             outbound_limiter: Arc::new(Semaphore::new(max_outbound_concurrency)),
             max_outbound_concurrency,
             breaker,
+            logger,
         }
     }
 }
@@ -141,15 +150,40 @@ async fn entity(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiEnvelope>, ApiError> {
-    let id = validate_non_empty(id, "entity id")?;
+    let started = Instant::now();
+    let id = match validate_non_empty(id, "entity id") {
+        Ok(id) => id,
+        Err(error) => {
+            log_error(
+                &state,
+                "entity",
+                "invalid_entity_id".to_owned(),
+                error.status_code(),
+                started,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let cache_key = cache_key::entity_key(&id, &[("lang", "en")]);
 
     if let Some(envelope) = cached_envelope(&state, &cache_key).await {
+        log_request(
+            &state,
+            "entity",
+            cache_key,
+            &envelope,
+            StatusCode::OK,
+            started,
+        )
+        .await;
         return Ok(Json(envelope));
     }
 
     if state.breaker.before_request().await == BreakerState::Open {
-        return stale_or_unavailable(&state, &cache_key).await.map(Json);
+        let result = stale_or_unavailable(&state, &cache_key).await;
+        log_result(&state, "entity", cache_key, &result, started).await;
+        return result.map(Json);
     }
 
     let _permit = state
@@ -162,9 +196,23 @@ async fn entity(
         Ok(data) => {
             state.breaker.record_success().await;
             store_fresh(&state, &cache_key, data.clone()).await;
-            Ok(Json(origin_envelope(data)))
+            let envelope = origin_envelope(data);
+            log_request(
+                &state,
+                "entity",
+                cache_key,
+                &envelope,
+                StatusCode::OK,
+                started,
+            )
+            .await;
+            Ok(Json(envelope))
         }
-        Err(error) => origin_failure(&state, &cache_key, error).await.map(Json),
+        Err(error) => {
+            let result = origin_failure(&state, &cache_key, error).await;
+            log_result(&state, "entity", cache_key, &result, started).await;
+            result.map(Json)
+        }
     }
 }
 
@@ -172,15 +220,40 @@ async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<ApiEnvelope>, ApiError> {
-    let query = validate_non_empty(params.q, "search query")?;
+    let started = Instant::now();
+    let query = match validate_non_empty(params.q, "search query") {
+        Ok(query) => query,
+        Err(error) => {
+            log_error(
+                &state,
+                "search",
+                "invalid_search_query".to_owned(),
+                error.status_code(),
+                started,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let cache_key = cache_key::search_key(&query, &[("lang", "en")]);
 
     if let Some(envelope) = cached_envelope(&state, &cache_key).await {
+        log_request(
+            &state,
+            "search",
+            cache_key,
+            &envelope,
+            StatusCode::OK,
+            started,
+        )
+        .await;
         return Ok(Json(envelope));
     }
 
     if state.breaker.before_request().await == BreakerState::Open {
-        return stale_or_unavailable(&state, &cache_key).await.map(Json);
+        let result = stale_or_unavailable(&state, &cache_key).await;
+        log_result(&state, "search", cache_key, &result, started).await;
+        return result.map(Json);
     }
 
     let _permit = state
@@ -193,9 +266,23 @@ async fn search(
         Ok(data) => {
             state.breaker.record_success().await;
             store_fresh(&state, &cache_key, data.clone()).await;
-            Ok(Json(origin_envelope(data)))
+            let envelope = origin_envelope(data);
+            log_request(
+                &state,
+                "search",
+                cache_key,
+                &envelope,
+                StatusCode::OK,
+                started,
+            )
+            .await;
+            Ok(Json(envelope))
         }
-        Err(error) => origin_failure(&state, &cache_key, error).await.map(Json),
+        Err(error) => {
+            let result = origin_failure(&state, &cache_key, error).await;
+            log_result(&state, "search", cache_key, &result, started).await;
+            result.map(Json)
+        }
     }
 }
 
@@ -203,15 +290,40 @@ async fn sparql(
     State(state): State<AppState>,
     Json(body): Json<SparqlRequest>,
 ) -> Result<Json<ApiEnvelope>, ApiError> {
-    let query = validate_non_empty(body.query, "sparql query")?;
+    let started = Instant::now();
+    let query = match validate_non_empty(body.query, "sparql query") {
+        Ok(query) => query,
+        Err(error) => {
+            log_error(
+                &state,
+                "sparql",
+                "invalid_sparql_query".to_owned(),
+                error.status_code(),
+                started,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let cache_key = cache_key::sparql_key(&query);
 
     if let Some(envelope) = cached_envelope(&state, &cache_key).await {
+        log_request(
+            &state,
+            "sparql",
+            cache_key,
+            &envelope,
+            StatusCode::OK,
+            started,
+        )
+        .await;
         return Ok(Json(envelope));
     }
 
     if state.breaker.before_request().await == BreakerState::Open {
-        return stale_or_unavailable(&state, &cache_key).await.map(Json);
+        let result = stale_or_unavailable(&state, &cache_key).await;
+        log_result(&state, "sparql", cache_key, &result, started).await;
+        return result.map(Json);
     }
 
     let _permit = state
@@ -224,9 +336,23 @@ async fn sparql(
         Ok(data) => {
             state.breaker.record_success().await;
             store_fresh(&state, &cache_key, data.clone()).await;
-            Ok(Json(origin_envelope(data)))
+            let envelope = origin_envelope(data);
+            log_request(
+                &state,
+                "sparql",
+                cache_key,
+                &envelope,
+                StatusCode::OK,
+                started,
+            )
+            .await;
+            Ok(Json(envelope))
         }
-        Err(error) => origin_failure(&state, &cache_key, error).await.map(Json),
+        Err(error) => {
+            let result = origin_failure(&state, &cache_key, error).await;
+            log_result(&state, "sparql", cache_key, &result, started).await;
+            result.map(Json)
+        }
     }
 }
 
@@ -304,6 +430,66 @@ async fn store_fresh(state: &AppState, key: &str, data: Value) {
     let _ = state.cache.set(key, &entry, state.cache_ttl).await;
 }
 
+async fn log_result(
+    state: &AppState,
+    route: &'static str,
+    query_hash: String,
+    result: &Result<ApiEnvelope, ApiError>,
+    started: Instant,
+) {
+    match result {
+        Ok(envelope) => {
+            log_request(state, route, query_hash, envelope, StatusCode::OK, started).await
+        }
+        Err(error) => {
+            log_error(state, route, query_hash, error.status_code(), started).await;
+        }
+    }
+}
+
+async fn log_request(
+    state: &AppState,
+    route: &'static str,
+    query_hash: String,
+    envelope: &ApiEnvelope,
+    status: StatusCode,
+    started: Instant,
+) {
+    state
+        .logger
+        .log(RequestLogEvent::new(
+            route,
+            query_hash,
+            envelope.cached,
+            envelope.stale,
+            started.elapsed().as_millis(),
+            "unknown",
+            status.as_u16(),
+        ))
+        .await;
+}
+
+async fn log_error(
+    state: &AppState,
+    route: &'static str,
+    query_hash: String,
+    status: StatusCode,
+    started: Instant,
+) {
+    state
+        .logger
+        .log(RequestLogEvent::new(
+            route,
+            query_hash,
+            false,
+            false,
+            started.elapsed().as_millis(),
+            "unknown",
+            status.as_u16(),
+        ))
+        .await;
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
@@ -331,9 +517,22 @@ impl IntoResponse for ApiError {
     }
 }
 
+impl ApiError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::OutboundLimiterClosed | Self::OriginUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::Origin(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::NoopLogger;
     use async_trait::async_trait;
     use axum::{
         body::Body,
@@ -419,6 +618,18 @@ mod tests {
         stale_entries: Mutex<HashMap<String, CachedEntry>>,
     }
 
+    #[derive(Debug, Default)]
+    struct CollectingLogger {
+        events: Mutex<Vec<RequestLogEvent>>,
+    }
+
+    #[async_trait]
+    impl RequestLogger for CollectingLogger {
+        async fn log(&self, event: RequestLogEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
     #[async_trait]
     impl ResponseCache for MemoryCache {
         async fn get(&self, key: &str) -> Result<Option<CachedEntry>, crate::cache::CacheError> {
@@ -477,6 +688,7 @@ mod tests {
             cache,
             Duration::from_secs(604_800),
             max_outbound_concurrency,
+            Arc::new(NoopLogger),
         )
     }
 
@@ -485,7 +697,29 @@ mod tests {
         cache: Arc<MemoryCache>,
         breaker: Arc<CircuitBreaker>,
     ) -> AppState {
-        AppState::with_breaker(origin, cache, Duration::from_secs(604_800), 2, breaker)
+        AppState::with_breaker(
+            origin,
+            cache,
+            Duration::from_secs(604_800),
+            2,
+            breaker,
+            Arc::new(NoopLogger),
+        )
+    }
+
+    fn test_state_with_logger(
+        origin: Arc<MockOrigin>,
+        cache: Arc<MemoryCache>,
+        logger: Arc<CollectingLogger>,
+    ) -> AppState {
+        AppState::with_breaker(
+            origin,
+            cache,
+            Duration::from_secs(604_800),
+            2,
+            Arc::new(CircuitBreaker::new(3, Duration::from_secs(30))),
+            logger,
+        )
     }
 
     #[tokio::test]
@@ -824,6 +1058,59 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let json = body_json(response).await;
         assert_eq!(json["error"]["code"], "origin_unavailable");
+    }
+
+    #[tokio::test]
+    async fn successful_request_emits_log_event() {
+        let origin = Arc::new(MockOrigin::default());
+        let cache = Arc::new(MemoryCache::default());
+        let logger = Arc::new(CollectingLogger::default());
+
+        let response = build_router(test_state_with_logger(origin, cache, logger.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/search?q=Albert%20Einstein")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events = logger.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].route, "search");
+        assert_eq!(events[0].status_code, 200);
+        assert!(!events[0].cache_hit);
+        assert!(!events[0].stale);
+    }
+
+    #[tokio::test]
+    async fn validation_error_emits_log_event() {
+        let logger = Arc::new(CollectingLogger::default());
+
+        let response = build_router(test_state_with_logger(
+            Arc::new(MockOrigin::default()),
+            Arc::new(MemoryCache::default()),
+            logger.clone(),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/v1/search?q=%20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let events = logger.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].route, "search");
+        assert_eq!(events[0].query_hash, "invalid_search_query");
+        assert_eq!(events[0].status_code, 400);
     }
 
     async fn request_json(request: Request<Body>) -> Value {
