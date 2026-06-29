@@ -1,4 +1,15 @@
 services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
   app:
     build: ./app
     environment:

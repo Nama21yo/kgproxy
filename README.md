@@ -36,3 +36,10 @@ docker compose up --build -d
 scripts/smoke-health.sh
 docker compose down
 ```
+
+Nginx proxies the app locally on port `8081`:
+
+```bash
+curl -fsS http://127.0.0.1:8081/v1/health
+docker compose exec nginx nginx -t
+```
