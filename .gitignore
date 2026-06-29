@@ -6,3 +6,4 @@
 /pg_data/
 dump.rdb
 *.log
+/.serena/
