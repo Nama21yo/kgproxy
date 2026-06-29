@@ -1,0 +1,40 @@
+services:
+  app:
+    build: ./app
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://kgproxy:${POSTGRES_PASSWORD:-kgproxy-dev-password}@postgres:5432/kgproxy
+      DBPEDIA_SPARQL_URL: https://dbpedia.org/sparql
+      MAX_OUTBOUND_CONCURRENCY: "2"
+      CACHE_TTL_SECONDS: "604800"
+      ORIGIN_TIMEOUT_MS: "2000"
+      MAX_ORIGIN_RESPONSE_BYTES: "102400"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru --save 60 1
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    command: postgres -c shared_buffers=64MB -c max_connections=20 -c work_mem=4MB
+    environment:
+      POSTGRES_DB: kgproxy
+      POSTGRES_USER: kgproxy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kgproxy-dev-password}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  pg_data:
