@@ -42,6 +42,11 @@ impl RequestLogEvent {
             metadata: json!({}),
         }
     }
+
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 #[derive(Debug, Error)]

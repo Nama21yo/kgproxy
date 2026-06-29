@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -199,13 +199,14 @@ async fn entity(
     let cache_key = cache_key::entity_key(&id, &[("lang", "en")]);
 
     if let Some(envelope) = cached_envelope(&state, &cache_key).await {
-        log_request(
+        log_request_with_metadata(
             &state,
             "entity",
             cache_key,
             &envelope,
             StatusCode::OK,
             started,
+            json!({ "entity_id": id }),
         )
         .await;
         return Ok(Json(envelope));
@@ -228,13 +229,14 @@ async fn entity(
             state.breaker.record_success().await;
             store_fresh(&state, &cache_key, data.clone()).await;
             let envelope = origin_envelope(data);
-            log_request(
+            log_request_with_metadata(
                 &state,
                 "entity",
                 cache_key,
                 &envelope,
                 StatusCode::OK,
                 started,
+                json!({ "entity_id": id }),
             )
             .await;
             Ok(Json(envelope))
@@ -486,18 +488,39 @@ async fn log_request(
     status: StatusCode,
     started: Instant,
 ) {
-    state
-        .logger
-        .log(RequestLogEvent::new(
-            route,
-            query_hash,
-            envelope.cached,
-            envelope.stale,
-            started.elapsed().as_millis(),
-            "unknown",
-            status.as_u16(),
-        ))
-        .await;
+    log_request_with_metadata(
+        state,
+        route,
+        query_hash,
+        envelope,
+        status,
+        started,
+        json!({}),
+    )
+    .await;
+}
+
+async fn log_request_with_metadata(
+    state: &AppState,
+    route: &'static str,
+    query_hash: String,
+    envelope: &ApiEnvelope,
+    status: StatusCode,
+    started: Instant,
+    metadata: Value,
+) {
+    let event = RequestLogEvent::new(
+        route,
+        query_hash,
+        envelope.cached,
+        envelope.stale,
+        started.elapsed().as_millis(),
+        "unknown",
+        status.as_u16(),
+    )
+    .with_metadata(metadata);
+
+    state.logger.log(event).await;
 }
 
 async fn log_error(
