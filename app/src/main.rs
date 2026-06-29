@@ -1,4 +1,10 @@
-use kgproxy::{config::Config, http::build_router};
+use std::sync::Arc;
+
+use kgproxy::{
+    config::Config,
+    http::{AppState, build_router},
+    origin::ReqwestDbpediaClient,
+};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -11,10 +17,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env()?;
+    let origin = ReqwestDbpediaClient::new(
+        config.dbpedia_sparql_url.clone(),
+        config.origin_timeout,
+        config.max_origin_response_bytes,
+    )?;
     let listener = TcpListener::bind(config.bind_addr).await?;
 
     tracing::info!(addr = %listener.local_addr()?, "kgproxy listening");
-    axum::serve(listener, build_router()).await?;
+    axum::serve(listener, build_router(AppState::new(Arc::new(origin)))).await?;
 
     Ok(())
 }
