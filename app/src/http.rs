@@ -4,11 +4,11 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -544,8 +544,8 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex,
         },
     };
     use tokio::time::sleep;

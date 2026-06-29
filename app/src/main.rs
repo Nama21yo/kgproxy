@@ -3,8 +3,8 @@ use std::sync::Arc;
 use kgproxy::{
     cache::RedisCache,
     config::Config,
-    http::{AppState, build_router},
-    logging::{ChannelLogger, postgres_pool},
+    http::{build_router, AppState},
+    logging::{postgres_pool, ChannelLogger},
     origin::ReqwestDbpediaClient,
 };
 use tokio::net::TcpListener;
