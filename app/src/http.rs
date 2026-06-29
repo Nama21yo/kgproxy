@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use crate::{
     cache::{CachedEntry, ResponseCache},
@@ -21,6 +22,8 @@ pub struct AppState {
     origin: Arc<dyn DbpediaClient>,
     cache: Arc<dyn ResponseCache>,
     cache_ttl: Duration,
+    outbound_limiter: Arc<Semaphore>,
+    max_outbound_concurrency: usize,
 }
 
 impl AppState {
@@ -28,11 +31,14 @@ impl AppState {
         origin: Arc<dyn DbpediaClient>,
         cache: Arc<dyn ResponseCache>,
         cache_ttl: Duration,
+        max_outbound_concurrency: usize,
     ) -> Self {
         Self {
             origin,
             cache,
             cache_ttl,
+            outbound_limiter: Arc::new(Semaphore::new(max_outbound_concurrency)),
+            max_outbound_concurrency,
         }
     }
 }
@@ -41,6 +47,8 @@ impl AppState {
 struct HealthResponse {
     status: &'static str,
     service: &'static str,
+    outbound_available_permits: usize,
+    max_outbound_concurrency: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +84,8 @@ struct SparqlRequest {
 enum ApiError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("outbound limiter is closed")]
+    OutboundLimiterClosed,
     #[error(transparent)]
     Origin(#[from] OriginError),
 }
@@ -89,10 +99,12 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "kgproxy",
+        outbound_available_permits: state.outbound_limiter.available_permits(),
+        max_outbound_concurrency: state.max_outbound_concurrency,
     })
 }
 
@@ -107,6 +119,11 @@ async fn entity(
         return Ok(Json(envelope));
     }
 
+    let _permit = state
+        .outbound_limiter
+        .acquire()
+        .await
+        .map_err(|_| ApiError::OutboundLimiterClosed)?;
     let data = state.origin.entity(&id).await?;
     store_fresh(&state, &cache_key, data.clone()).await;
 
@@ -124,6 +141,11 @@ async fn search(
         return Ok(Json(envelope));
     }
 
+    let _permit = state
+        .outbound_limiter
+        .acquire()
+        .await
+        .map_err(|_| ApiError::OutboundLimiterClosed)?;
     let data = state.origin.search(&query).await?;
     store_fresh(&state, &cache_key, data.clone()).await;
 
@@ -141,6 +163,11 @@ async fn sparql(
         return Ok(Json(envelope));
     }
 
+    let _permit = state
+        .outbound_limiter
+        .acquire()
+        .await
+        .map_err(|_| ApiError::OutboundLimiterClosed)?;
     let data = state.origin.sparql(&query).await?;
     store_fresh(&state, &cache_key, data.clone()).await;
 
@@ -196,6 +223,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
+            Self::OutboundLimiterClosed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "outbound_limiter_closed",
+                self.to_string(),
+            ),
             Self::Origin(error) => (StatusCode::BAD_GATEWAY, "origin_error", error.to_string()),
         };
 
@@ -226,27 +258,54 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
     };
+    use tokio::time::sleep;
     use tower::ServiceExt;
 
     #[derive(Debug, Default)]
     struct MockOrigin {
         calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        delay: Duration,
+    }
+
+    impl MockOrigin {
+        fn with_delay(delay: Duration) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                delay,
+            }
+        }
+
+        async fn track_call(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+
+            if !self.delay.is_zero() {
+                sleep(self.delay).await;
+            }
+
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
     impl DbpediaClient for MockOrigin {
         async fn entity(&self, id: &str) -> Result<Value, OriginError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.track_call().await;
             Ok(json!({ "kind": "entity", "id": id }))
         }
 
         async fn search(&self, query: &str) -> Result<Value, OriginError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.track_call().await;
             Ok(json!({ "kind": "search", "query": query }))
         }
 
         async fn sparql(&self, query: &str) -> Result<Value, OriginError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.track_call().await;
             Ok(json!({ "kind": "sparql", "query": query }))
         }
     }
@@ -284,7 +343,20 @@ mod tests {
     }
 
     fn test_state(origin: Arc<MockOrigin>, cache: Arc<MemoryCache>) -> AppState {
-        AppState::new(origin, cache, Duration::from_secs(604_800))
+        test_state_with_limit(origin, cache, 2)
+    }
+
+    fn test_state_with_limit(
+        origin: Arc<MockOrigin>,
+        cache: Arc<MemoryCache>,
+        max_outbound_concurrency: usize,
+    ) -> AppState {
+        AppState::new(
+            origin,
+            cache,
+            Duration::from_secs(604_800),
+            max_outbound_concurrency,
+        )
     }
 
     #[tokio::test]
@@ -305,6 +377,8 @@ mod tests {
 
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "kgproxy");
+        assert_eq!(json["outbound_available_permits"], 2);
+        assert_eq!(json["max_outbound_concurrency"], 2);
     }
 
     #[tokio::test]
@@ -449,6 +523,90 @@ mod tests {
         let stored = cache.get(&key).await.unwrap().unwrap();
         assert_eq!(stored.payload["kind"], "search");
         assert_eq!(stored.hit_count, 0);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_acquire_outbound_permit() {
+        let origin = Arc::new(MockOrigin::default());
+        let cache = Arc::new(MemoryCache::default());
+        let key = cache_key::entity_key("Albert_Einstein", &[("lang", "en")]);
+        cache
+            .set(
+                &key,
+                &CachedEntry::fresh(json!({ "kind": "cached-entity" })),
+                Duration::from_secs(604_800),
+            )
+            .await
+            .unwrap();
+
+        let response = build_router(test_state_with_limit(origin.clone(), cache, 0))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/entity/Albert_Einstein")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["cached"], true);
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cache_misses_are_limited_to_two_concurrent_origin_calls() {
+        let origin = Arc::new(MockOrigin::with_delay(Duration::from_millis(40)));
+        let cache = Arc::new(MemoryCache::default());
+        let router = build_router(test_state(origin.clone(), cache));
+
+        let mut tasks = Vec::new();
+        for index in 0..5 {
+            let router = router.clone();
+            tasks.push(tokio::spawn(async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/v1/entity/Entity_{index}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(origin.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn permit_is_released_after_origin_call() {
+        let origin = Arc::new(MockOrigin::default());
+        let cache = Arc::new(MemoryCache::default());
+        let state = test_state_with_limit(origin, cache, 1);
+        let router = build_router(state);
+
+        for entity in ["First", "Second"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/entity/{entity}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     async fn request_json(request: Request<Body>) -> Value {

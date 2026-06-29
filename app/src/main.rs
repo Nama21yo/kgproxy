@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(origin),
             Arc::new(cache),
             config.cache_ttl,
+            config.max_outbound_concurrency,
         )),
     )
     .await?;
