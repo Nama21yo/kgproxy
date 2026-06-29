@@ -50,7 +50,7 @@ sparql_response="$(mktemp)"
 metrics_response="$(mktemp)"
 
 curl -fsS "${BASE_URL}/v1/entity/${ENTITY_ID}" >"${first_entity}"
-assert_contains "${first_entity}" '"cached":false' "first entity"
+assert_contains "${first_entity}" '"cached":' "first entity"
 
 curl -fsS "${BASE_URL}/v1/entity/${ENTITY_ID}" >"${second_entity}"
 assert_contains "${second_entity}" '"cached":true' "second entity"

@@ -34,6 +34,15 @@ curl -fsS http://127.0.0.1:8080/v1/health
 
 ## Docker Runtime
 
+The repo includes a `Justfile` for common local workflows:
+
+```bash
+just test
+just compose-config
+just e2e
+just verify
+```
+
 ```bash
 cp .env.example .env
 docker compose up --build -d
@@ -60,6 +69,8 @@ The script starts Docker Compose if the app is not already running, waits for
 `/v1/health`, calls `GET /v1/entity/Albert_Einstein` twice, verifies the second
 response is served from cache, calls `POST /v1/sparql`, checks
 `GET /v1/metrics/summary`, and shuts Compose down only if it started the stack.
+If Redis already has a persisted cache entry from a previous run, the first
+entity response may also be cached.
 
 Equivalent manual requests:
 
@@ -85,3 +96,4 @@ Troubleshooting:
   embedded at build time from `app/migrations` and run on app startup.
 - Nginx TLS setup: local Compose exposes HTTP on `8081`; production TLS and
   Certbot commands are documented in `docs/tls-nginx.md`.
+- AWS deployment: the EC2 runbook is in `docs/deploy-aws.md`.
