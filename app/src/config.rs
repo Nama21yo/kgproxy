@@ -10,6 +10,9 @@ const DEFAULT_CACHE_TTL_SECONDS: u64 = 604_800;
 const DEFAULT_MAX_OUTBOUND_CONCURRENCY: usize = 2;
 const DEFAULT_ORIGIN_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_MAX_ORIGIN_RESPONSE_BYTES: usize = 100 * 1024;
+const DEFAULT_CACHE_WARMER_ENABLED: bool = false;
+const DEFAULT_CACHE_WARMER_INTERVAL_SECONDS: u64 = 3_600;
+const DEFAULT_CACHE_WARMER_TOP_K: i64 = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -21,6 +24,9 @@ pub struct Config {
     pub max_outbound_concurrency: usize,
     pub origin_timeout: Duration,
     pub max_origin_response_bytes: usize,
+    pub cache_warmer_enabled: bool,
+    pub cache_warmer_interval: Duration,
+    pub cache_warmer_top_k: i64,
 }
 
 #[derive(Debug, Error)]
@@ -52,6 +58,24 @@ impl Config {
             "MAX_ORIGIN_RESPONSE_BYTES",
             DEFAULT_MAX_ORIGIN_RESPONSE_BYTES,
         )?;
+        let cache_warmer_enabled = parse_env("CACHE_WARMER_ENABLED", DEFAULT_CACHE_WARMER_ENABLED)?;
+        let cache_warmer_interval = Duration::from_secs(parse_env(
+            "CACHE_WARMER_INTERVAL_SECONDS",
+            DEFAULT_CACHE_WARMER_INTERVAL_SECONDS,
+        )?);
+        let cache_warmer_top_k = parse_env("CACHE_WARMER_TOP_K", DEFAULT_CACHE_WARMER_TOP_K)?;
+        if cache_warmer_interval.is_zero() {
+            return Err(ConfigError::InvalidValue {
+                name: "CACHE_WARMER_INTERVAL_SECONDS",
+                value: "0".to_owned(),
+            });
+        }
+        if cache_warmer_top_k < 1 {
+            return Err(ConfigError::InvalidValue {
+                name: "CACHE_WARMER_TOP_K",
+                value: cache_warmer_top_k.to_string(),
+            });
+        }
 
         Ok(Self {
             bind_addr,
@@ -62,6 +86,9 @@ impl Config {
             max_outbound_concurrency,
             origin_timeout,
             max_origin_response_bytes,
+            cache_warmer_enabled,
+            cache_warmer_interval,
+            cache_warmer_top_k,
         })
     }
 }
@@ -97,5 +124,8 @@ mod tests {
         assert_eq!(config.max_outbound_concurrency, 2);
         assert_eq!(config.origin_timeout, Duration::from_millis(2_000));
         assert_eq!(config.max_origin_response_bytes, 100 * 1024);
+        assert!(!config.cache_warmer_enabled);
+        assert_eq!(config.cache_warmer_interval, Duration::from_secs(3_600));
+        assert_eq!(config.cache_warmer_top_k, 25);
     }
 }

@@ -1,9 +1,14 @@
 /app/target/
+/frontend/node_modules/
+/frontend/dist/
 /.env
 /.env.*
 !/.env.example
 /redis_data/
 /pg_data/
+/certbot/conf/
+/certbot/www/
+/nginx/conf.d/production.conf
 dump.rdb
 *.log
 /.serena/

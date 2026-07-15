@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use kgproxy::{
-    cache::RedisCache,
+    cache::{RedisCache, ResponseCache},
     config::Config,
     http::{AppState, build_router},
     logging::{ChannelLogger, postgres_pool},
     metrics::PostgresMetricsReader,
-    origin::ReqwestDbpediaClient,
+    origin::{DbpediaClient, ReqwestDbpediaClient},
+    warmer::{CacheWarmer, PostgresPopularEntitySource, spawn_cache_warmer},
 };
 use tokio::net::TcpListener;
 
@@ -20,24 +21,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env()?;
-    let origin = ReqwestDbpediaClient::new(
+    let origin: Arc<dyn DbpediaClient> = Arc::new(ReqwestDbpediaClient::new(
         config.dbpedia_sparql_url.clone(),
         config.origin_timeout,
         config.max_origin_response_bytes,
-    )?;
-    let cache = RedisCache::new(&config.redis_url)?;
+    )?);
+    let cache: Arc<dyn ResponseCache> = Arc::new(RedisCache::new(&config.redis_url)?);
     let postgres = postgres_pool(&config.database_url)?;
     sqlx::migrate!("./migrations").run(&postgres).await?;
     let logger = ChannelLogger::spawn(postgres.clone(), 1024);
-    let metrics = PostgresMetricsReader::new(postgres);
+    let metrics = PostgresMetricsReader::new(postgres.clone());
+    if config.cache_warmer_enabled {
+        let warmer = Arc::new(CacheWarmer::new(
+            Arc::new(PostgresPopularEntitySource::new(postgres.clone())),
+            origin.clone(),
+            cache.clone(),
+            config.cache_ttl,
+        ));
+        spawn_cache_warmer(
+            warmer,
+            config.cache_warmer_interval,
+            config.cache_warmer_top_k,
+        );
+        tracing::info!(
+            interval_seconds = config.cache_warmer_interval.as_secs(),
+            top_k = config.cache_warmer_top_k,
+            "cache warmer enabled"
+        );
+    }
     let listener = TcpListener::bind(config.bind_addr).await?;
 
     tracing::info!(addr = %listener.local_addr()?, "kgproxy listening");
     axum::serve(
         listener,
         build_router(AppState::with_metrics(
-            Arc::new(origin),
-            Arc::new(cache),
+            origin,
+            cache,
             config.cache_ttl,
             config.max_outbound_concurrency,
             Arc::new(logger),

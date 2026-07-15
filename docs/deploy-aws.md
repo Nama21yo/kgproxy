@@ -1,38 +1,49 @@
 # AWS Deployment Runbook
 
-This runbook deploys KGProxy on one AWS EC2 `t3.micro` instance in
-`us-east-1`, matching the MVP capacity plan.
+This runbook deploys KGProxy on one AWS EC2 `t3.micro` instance in `us-east-1`.
+The production path uses Docker Compose, Nginx, and Let's Encrypt TLS.
 
 ## Required Inputs
 
-- EC2 instance: Ubuntu 24.04 LTS, `t3.micro`, 20 GB gp3 EBS
+- EC2 instance: Ubuntu 24.04 LTS, `t3.micro`, 20 GB gp3 EBS.
 - Security group:
-  - `22/tcp` from the admin IP only
-  - `80/tcp` from `0.0.0.0/0`
-  - `443/tcp` from `0.0.0.0/0`
-  - no public `6379/tcp` or `5432/tcp`
-- DNS `A` record pointing the API hostname to the instance public IP
-- GitHub deploy access for `https://github.com/Nama21yo/kgproxy.git`
-- Local `.env` file on the server with:
-  - `POSTGRES_PASSWORD`
+  - `22/tcp` from admin IP only.
+  - `80/tcp` from `0.0.0.0/0`.
+  - `443/tcp` from `0.0.0.0/0`.
+  - no public `6379/tcp` or `5432/tcp`.
+- DNS `A` record pointing the API hostname to the instance public IP.
+- GitHub deploy access to `https://github.com/Nama21yo/kgproxy.git`.
+- Local `.env` file on the server.
 
-The app service sets these runtime variables in `docker-compose.yml`:
+Required `.env` values:
 
-- `BIND_ADDR=0.0.0.0:8080`
-- `REDIS_URL=redis://redis:6379/0`
-- `DATABASE_URL=postgres://kgproxy:${POSTGRES_PASSWORD}@postgres:5432/kgproxy`
-- `DBPEDIA_SPARQL_URL=https://dbpedia.org/sparql`
-- `MAX_OUTBOUND_CONCURRENCY=2`
-- `CACHE_TTL_SECONDS=604800`
-- `ORIGIN_TIMEOUT_MS=2000`
-- `MAX_ORIGIN_RESPONSE_BYTES=102400`
+```bash
+POSTGRES_PASSWORD=replace-with-generated-password
+NGINX_HTTP_PORT=80
+CACHE_WARMER_ENABLED=false
+CACHE_WARMER_INTERVAL_SECONDS=3600
+CACHE_WARMER_TOP_K=25
+```
+
+The app service also sets these runtime defaults in `docker-compose.yml`:
+
+```bash
+BIND_ADDR=0.0.0.0:8080
+REDIS_URL=redis://redis:6379/0
+DATABASE_URL=postgres://kgproxy:${POSTGRES_PASSWORD}@postgres:5432/kgproxy
+DBPEDIA_SPARQL_URL=https://dbpedia.org/sparql
+MAX_OUTBOUND_CONCURRENCY=2
+CACHE_TTL_SECONDS=604800
+ORIGIN_TIMEOUT_MS=2000
+MAX_ORIGIN_RESPONSE_BYTES=102400
+```
 
 ## Instance Setup
 
 ```bash
 sudo apt update
 sudo apt upgrade -y
-sudo apt install -y ca-certificates curl git nginx certbot
+sudo apt install -y ca-certificates curl git
 sudo install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
   sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -45,7 +56,7 @@ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin d
 sudo usermod -aG docker "$USER"
 ```
 
-Log out and back in so the Docker group membership applies.
+Log out and back in so Docker group membership applies.
 
 ## App Deployment
 
@@ -58,39 +69,72 @@ cp .env.example .env
 openssl rand -base64 32
 ```
 
-Put the generated value in `.env`:
+Put the generated password in `.env`:
 
 ```bash
 POSTGRES_PASSWORD=replace-with-generated-password
+NGINX_HTTP_PORT=80
 ```
 
-Start the stack and run the smoke path:
+Build the frontend dashboard:
 
 ```bash
-docker compose up --build -d
-scripts/e2e-smoke.sh
+cd frontend
+bun install
+bun run build
+cd ..
 ```
 
-The first image build is slow on `t3.micro`; later builds reuse Docker layers.
-
-## Nginx And TLS
-
-Local Compose exposes Nginx on `8081` for development, but production should
-bind ports `80` and `443`. Update the Compose Nginx port mapping before public
-deployment:
-
-```yaml
-ports:
-  - "80:80"
-  - "443:443"
-```
-
-Use the template in `docs/tls-nginx.md` for the TLS server block and Certbot
-commands. After issuing certificates, validate the edge config:
+Start the HTTP-capable production stack:
 
 ```bash
-docker compose exec nginx nginx -t
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d app redis postgres nginx
+```
+
+Verify HTTP before issuing certificates:
+
+```bash
+curl -fsS http://kgproxy.example.com/v1/health
+docker compose -f docker-compose.yml -f docker-compose.prod.yml exec nginx nginx -t
+```
+
+## TLS Setup
+
+Issue the Let's Encrypt certificate with the bundled Certbot service:
+
+```bash
+docker compose --profile tls run --rm certbot certonly \
+  --webroot \
+  -w /var/www/certbot \
+  -d kgproxy.example.com \
+  --email you@example.com \
+  --agree-tos \
+  --no-eff-email
+```
+
+Enable the production Nginx config:
+
+```bash
+cp nginx/conf.d/production.conf.example nginx/conf.d/production.conf
+sed -i 's/kgproxy.example.com/your-real-domain.example/g' nginx/conf.d/production.conf
+docker compose -f docker-compose.yml -f docker-compose.prod.yml restart nginx
+```
+
+Validate HTTPS:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml exec nginx nginx -t
 curl -fsS https://kgproxy.example.com/v1/health
+curl -fsS https://kgproxy.example.com/dashboard/
+curl -I http://kgproxy.example.com/v1/health
+```
+
+Expected result: HTTPS returns KGProxy health JSON and HTTP redirects to HTTPS.
+
+Certificate renewal cron:
+
+```cron
+0 3 * * * cd /opt/kgproxy && docker compose --profile tls run --rm certbot renew --quiet && docker compose -f docker-compose.yml -f docker-compose.prod.yml restart nginx
 ```
 
 ## Operations
@@ -98,11 +142,12 @@ curl -fsS https://kgproxy.example.com/v1/health
 Common commands:
 
 ```bash
-docker compose ps
-docker compose logs -f app
+docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f app
 docker stats
-curl -fsS http://127.0.0.1:8080/v1/health
-curl -fsS http://127.0.0.1:8080/v1/metrics/summary
+curl -fsS https://kgproxy.example.com/v1/health
+curl -fsS https://kgproxy.example.com/v1/metrics/summary
+curl -fsS https://kgproxy.example.com/dashboard/
 ```
 
 Upgrade to the latest `main`:
@@ -110,7 +155,7 @@ Upgrade to the latest `main`:
 ```bash
 cd /opt/kgproxy
 git pull --ff-only
-docker compose up --build -d
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
 scripts/e2e-smoke.sh
 ```
 
@@ -120,7 +165,7 @@ Rollback to the previous commit:
 cd /opt/kgproxy
 git log --oneline -5
 git checkout <previous-good-commit>
-docker compose up --build -d
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
 scripts/e2e-smoke.sh
 ```
 
@@ -132,10 +177,8 @@ git switch main
 
 ## Backups
 
-Request logs are analytics data, not the source of truth, but daily backups make
-demo and dashboard history recoverable.
-
-Create `/opt/kgproxy/backups`:
+Request logs are analytics data, not source truth, but daily backups make demo
+and dashboard history recoverable.
 
 ```bash
 mkdir -p /opt/kgproxy/backups
@@ -163,20 +206,22 @@ gunzip -c /opt/kgproxy/backups/kgproxy-YYYY-MM-DD.sql.gz | \
 ## Cost Controls
 
 - Create an AWS Budget alert before leaving the instance running.
-- Do not create a NAT Gateway; it is unnecessary for this public-subnet MVP and
-  costs more than the instance.
-- Keep the Elastic IP attached to the running instance. An unattached Elastic IP
-  accrues monthly charges.
-- Set CloudWatch log retention if shipping logs there; the default is indefinite
-  retention.
-- Keep Redis at `128mb` with `allkeys-lru` and Postgres at
-  `shared_buffers=64MB`, `max_connections=20`, and `work_mem=4MB` on `t3.micro`.
+- Do not create a NAT Gateway; the MVP does not need one.
+- Keep the Elastic IP attached to the running instance.
+- Set CloudWatch log retention if shipping logs there.
+- Keep Redis at `128mb` with `allkeys-lru`.
+- Keep Postgres tuned with `shared_buffers=64MB`, `max_connections=20`, and
+  `work_mem=4MB` on `t3.micro`.
 
 ## Verification Checklist
 
-- `docker compose config` succeeds.
-- `scripts/e2e-smoke.sh` passes on the instance.
-- `curl -fsS http://127.0.0.1:8080/v1/health` returns JSON.
-- `curl -fsS http://127.0.0.1:8080/v1/metrics/summary` returns JSON.
-- `docker compose exec nginx nginx -t` passes after TLS configuration.
-- Security group exposes only SSH from the admin IP plus public HTTP/HTTPS.
+- `docker compose -f docker-compose.yml -f docker-compose.prod.yml config`
+  succeeds.
+- `curl -fsS http://kgproxy.example.com/v1/health` works before TLS.
+- Certbot issues a certificate into `certbot/conf`.
+- `docker compose -f docker-compose.yml -f docker-compose.prod.yml exec nginx nginx -t`
+  passes after TLS config is enabled.
+- `curl -fsS https://kgproxy.example.com/v1/health` returns JSON.
+- `curl -fsS https://kgproxy.example.com/dashboard/` returns the dashboard HTML.
+- `curl -I http://kgproxy.example.com/v1/health` redirects to HTTPS.
+- Security group exposes only SSH from admin IP plus public HTTP/HTTPS.
