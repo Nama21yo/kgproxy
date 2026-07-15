@@ -2,6 +2,7 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
+DASHBOARD_URL="${DASHBOARD_URL:-http://127.0.0.1:8081}"
 ENTITY_ID="${ENTITY_ID:-Albert_Einstein}"
 COMPOSE_STARTED=0
 
@@ -48,6 +49,7 @@ first_entity="$(mktemp)"
 second_entity="$(mktemp)"
 sparql_response="$(mktemp)"
 metrics_response="$(mktemp)"
+dashboard_response="$(mktemp)"
 
 curl -fsS "${BASE_URL}/v1/entity/${ENTITY_ID}" >"${first_entity}"
 assert_contains "${first_entity}" '"cached":' "first entity"
@@ -64,4 +66,7 @@ assert_contains "${sparql_response}" '"source":' "sparql"
 curl -fsS "${BASE_URL}/v1/metrics/summary" >"${metrics_response}"
 assert_contains "${metrics_response}" '"total_requests":' "metrics"
 
-echo "E2E smoke passed: health, entity miss, entity hit, SPARQL passthrough, and metrics all responded."
+curl -fsS "${DASHBOARD_URL}/dashboard/" >"${dashboard_response}"
+assert_contains "${dashboard_response}" 'KGProxy Dashboard' "dashboard"
+
+echo "E2E smoke passed: health, entity miss, entity hit, SPARQL passthrough, metrics, and dashboard all responded."

@@ -16,8 +16,25 @@ pub struct MetricsSummary {
     pub p95_latency_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MetricsPoint {
+    pub observed_at_unix_secs: u64,
+    pub total_requests: u64,
+    pub cache_hit_rate: f64,
+    pub stale_response_rate: f64,
+    pub p95_latency_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MetricsTimeseries {
+    pub rolling_window_seconds: u64,
+    pub bucket_seconds: u64,
+    pub points: Vec<MetricsPoint>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestMetricRow {
+    pub observed_at_unix_secs: u64,
     pub cache_hit: bool,
     pub stale: bool,
     pub latency_ms: u128,
@@ -33,6 +50,7 @@ pub enum MetricsError {
 #[async_trait]
 pub trait MetricsReader: Send + Sync {
     async fn summary(&self, window_seconds: u64) -> Result<MetricsSummary, MetricsError>;
+    async fn timeseries(&self, window_seconds: u64) -> Result<MetricsTimeseries, MetricsError>;
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +60,14 @@ pub struct EmptyMetricsReader;
 impl MetricsReader for EmptyMetricsReader {
     async fn summary(&self, window_seconds: u64) -> Result<MetricsSummary, MetricsError> {
         Ok(summarize_rows(window_seconds, &[]))
+    }
+
+    async fn timeseries(&self, window_seconds: u64) -> Result<MetricsTimeseries, MetricsError> {
+        Ok(MetricsTimeseries {
+            rolling_window_seconds: window_seconds,
+            bucket_seconds: 3_600,
+            points: Vec::new(),
+        })
     }
 }
 
@@ -61,7 +87,7 @@ impl MetricsReader for PostgresMetricsReader {
     async fn summary(&self, window_seconds: u64) -> Result<MetricsSummary, MetricsError> {
         let rows = sqlx::query(
             r#"
-            SELECT cache_hit, stale, latency_ms, status_code
+            SELECT observed_at_unix_secs, cache_hit, stale, latency_ms, status_code
             FROM request_logs
             WHERE observed_at_unix_secs >= EXTRACT(EPOCH FROM NOW())::BIGINT - $1
             "#,
@@ -73,6 +99,7 @@ impl MetricsReader for PostgresMetricsReader {
         let rows = rows
             .into_iter()
             .map(|row| RequestMetricRow {
+                observed_at_unix_secs: row.get::<i64, _>("observed_at_unix_secs") as u64,
                 cache_hit: row.get("cache_hit"),
                 stale: row.get("stale"),
                 latency_ms: row.get::<i32, _>("latency_ms") as u128,
@@ -81,6 +108,33 @@ impl MetricsReader for PostgresMetricsReader {
             .collect::<Vec<_>>();
 
         Ok(summarize_rows(window_seconds, &rows))
+    }
+
+    async fn timeseries(&self, window_seconds: u64) -> Result<MetricsTimeseries, MetricsError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT observed_at_unix_secs, cache_hit, stale, latency_ms, status_code
+            FROM request_logs
+            WHERE observed_at_unix_secs >= EXTRACT(EPOCH FROM NOW())::BIGINT - $1
+            ORDER BY observed_at_unix_secs ASC
+            "#,
+        )
+        .bind(i64::try_from(window_seconds).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let rows = rows
+            .into_iter()
+            .map(|row| RequestMetricRow {
+                observed_at_unix_secs: row.get::<i64, _>("observed_at_unix_secs") as u64,
+                cache_hit: row.get("cache_hit"),
+                stale: row.get("stale"),
+                latency_ms: row.get::<i32, _>("latency_ms") as u128,
+                status_code: row.get::<i16, _>("status_code") as u16,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(timeseries_from_rows(window_seconds, &rows))
     }
 }
 
@@ -104,6 +158,37 @@ pub fn summarize_rows(window_seconds: u64, rows: &[RequestMetricRow]) -> Metrics
         stale_response_rate: ratio(stale_responses, total_requests),
         origin_error_rate: ratio(origin_errors, total_requests),
         p95_latency_ms,
+    }
+}
+
+pub fn timeseries_from_rows(window_seconds: u64, rows: &[RequestMetricRow]) -> MetricsTimeseries {
+    const BUCKET_SECONDS: u64 = 3_600;
+    let mut buckets: std::collections::BTreeMap<u64, Vec<RequestMetricRow>> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        let bucket = row.observed_at_unix_secs / BUCKET_SECONDS * BUCKET_SECONDS;
+        buckets.entry(bucket).or_default().push(row.clone());
+    }
+
+    let points = buckets
+        .into_iter()
+        .map(|(observed_at_unix_secs, bucket_rows)| {
+            let summary = summarize_rows(BUCKET_SECONDS, &bucket_rows);
+            MetricsPoint {
+                observed_at_unix_secs,
+                total_requests: summary.total_requests,
+                cache_hit_rate: summary.cache_hit_rate,
+                stale_response_rate: summary.stale_response_rate,
+                p95_latency_ms: summary.p95_latency_ms,
+            }
+        })
+        .collect();
+
+    MetricsTimeseries {
+        rolling_window_seconds: window_seconds,
+        bucket_seconds: BUCKET_SECONDS,
+        points,
     }
 }
 
@@ -133,24 +218,28 @@ mod tests {
     fn summary_calculates_rates_and_latency_percentile() {
         let rows = vec![
             RequestMetricRow {
+                observed_at_unix_secs: 1_700_000_000,
                 cache_hit: true,
                 stale: false,
                 latency_ms: 10,
                 status_code: 200,
             },
             RequestMetricRow {
+                observed_at_unix_secs: 1_700_000_100,
                 cache_hit: false,
                 stale: false,
                 latency_ms: 100,
                 status_code: 200,
             },
             RequestMetricRow {
+                observed_at_unix_secs: 1_700_000_200,
                 cache_hit: true,
                 stale: true,
                 latency_ms: 12,
                 status_code: 200,
             },
             RequestMetricRow {
+                observed_at_unix_secs: 1_700_000_300,
                 cache_hit: false,
                 stale: false,
                 latency_ms: 250,
@@ -168,6 +257,34 @@ mod tests {
         assert_eq!(summary.stale_response_rate, 0.25);
         assert_eq!(summary.origin_error_rate, 0.25);
         assert_eq!(summary.p95_latency_ms, 250);
+    }
+
+    #[test]
+    fn timeseries_groups_rows_into_hourly_points() {
+        let rows = vec![
+            RequestMetricRow {
+                observed_at_unix_secs: 7_200,
+                cache_hit: true,
+                stale: false,
+                latency_ms: 10,
+                status_code: 200,
+            },
+            RequestMetricRow {
+                observed_at_unix_secs: 7_201,
+                cache_hit: false,
+                stale: false,
+                latency_ms: 20,
+                status_code: 200,
+            },
+        ];
+
+        let series = timeseries_from_rows(86_400, &rows);
+
+        assert_eq!(series.bucket_seconds, 3_600);
+        assert_eq!(series.points.len(), 1);
+        assert_eq!(series.points[0].observed_at_unix_secs, 7_200);
+        assert_eq!(series.points[0].total_requests, 2);
+        assert_eq!(series.points[0].cache_hit_rate, 0.5);
     }
 
     #[test]
