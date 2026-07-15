@@ -26,10 +26,12 @@ pub fn search_key(query: &str, params: &[(&str, &str)]) -> String {
 }
 
 pub fn sparql_key(query: &str) -> String {
-    digest_parts([
-        CacheNamespace::Sparql.as_str(),
-        normalize_sparql_whitespace(query).as_str(),
-    ])
+    sparql_key_with_params(query, &[])
+}
+
+pub fn sparql_key_with_params(query: &str, params: &[(&str, &str)]) -> String {
+    let normalized_query = normalize_sparql_whitespace(query);
+    rest_key(CacheNamespace::Sparql, normalized_query.as_str(), params)
 }
 
 fn rest_key(namespace: CacheNamespace, resource: &str, params: &[(&str, &str)]) -> String {

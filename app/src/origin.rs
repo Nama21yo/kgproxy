@@ -7,9 +7,23 @@ use thiserror::Error;
 
 #[async_trait]
 pub trait DbpediaClient: Send + Sync {
-    async fn entity(&self, id: &str) -> Result<Value, OriginError>;
-    async fn search(&self, query: &str) -> Result<Value, OriginError>;
-    async fn sparql(&self, query: &str) -> Result<Value, OriginError>;
+    async fn entity(
+        &self,
+        id: &str,
+        endpoint_override: Option<&str>,
+        lang: &str,
+    ) -> Result<Value, OriginError>;
+    async fn search(
+        &self,
+        query: &str,
+        endpoint_override: Option<&str>,
+        lang: &str,
+    ) -> Result<Value, OriginError>;
+    async fn sparql(
+        &self,
+        query: &str,
+        endpoint_override: Option<&str>,
+    ) -> Result<Value, OriginError>;
 }
 
 #[derive(Debug, Clone)]
@@ -46,10 +60,15 @@ impl ReqwestDbpediaClient {
         })
     }
 
-    async fn execute_sparql(&self, query: &str) -> Result<Value, OriginError> {
+    async fn execute_sparql(
+        &self,
+        query: &str,
+        endpoint_override: Option<&str>,
+    ) -> Result<Value, OriginError> {
+        let endpoint = endpoint_override.unwrap_or(&self.endpoint);
         let response = self
             .client
-            .post(&self.endpoint)
+            .post(endpoint)
             .header("accept", "application/sparql-results+json")
             .form(&[("query", query)])
             .send()
@@ -72,27 +91,43 @@ impl ReqwestDbpediaClient {
 
 #[async_trait]
 impl DbpediaClient for ReqwestDbpediaClient {
-    async fn entity(&self, id: &str) -> Result<Value, OriginError> {
-        self.execute_sparql(&entity_query(id)).await
+    async fn entity(
+        &self,
+        id: &str,
+        endpoint_override: Option<&str>,
+        lang: &str,
+    ) -> Result<Value, OriginError> {
+        self.execute_sparql(&entity_query(id, lang), endpoint_override)
+            .await
     }
 
-    async fn search(&self, query: &str) -> Result<Value, OriginError> {
-        self.execute_sparql(&search_query(query, 10)).await
+    async fn search(
+        &self,
+        query: &str,
+        endpoint_override: Option<&str>,
+        lang: &str,
+    ) -> Result<Value, OriginError> {
+        self.execute_sparql(&search_query(query, 10, lang), endpoint_override)
+            .await
     }
 
-    async fn sparql(&self, query: &str) -> Result<Value, OriginError> {
-        self.execute_sparql(query).await
+    async fn sparql(
+        &self,
+        query: &str,
+        endpoint_override: Option<&str>,
+    ) -> Result<Value, OriginError> {
+        self.execute_sparql(query, endpoint_override).await
     }
 }
 
-pub fn entity_query(id: &str) -> String {
+pub fn entity_query(id: &str, lang: &str) -> String {
     let resource = format!("http://dbpedia.org/resource/{}", encode_resource_id(id));
 
     format!(
         r#"SELECT ?label ?abstract ?property ?value WHERE {{
   VALUES ?entity {{ <{resource}> }}
-  OPTIONAL {{ ?entity rdfs:label ?label FILTER (lang(?label) = "en") }}
-  OPTIONAL {{ ?entity dbo:abstract ?abstract FILTER (lang(?abstract) = "en") }}
+  OPTIONAL {{ ?entity rdfs:label ?label FILTER (lang(?label) = "{lang}") }}
+  OPTIONAL {{ ?entity dbo:abstract ?abstract FILTER (lang(?abstract) = "{lang}") }}
   OPTIONAL {{
     ?entity ?property ?value .
     FILTER (?property IN (dbo:birthDate, dbo:deathDate, dbo:birthPlace, dbo:knownFor))
@@ -102,16 +137,16 @@ LIMIT 50"#,
     )
 }
 
-pub fn search_query(label: &str, limit: u16) -> String {
+pub fn search_query(label: &str, limit: u16, lang: &str) -> String {
     let escaped_label = escape_sparql_string(label);
     let bounded_limit = limit.clamp(1, 50);
 
     format!(
         r#"SELECT ?entity ?label ?abstract WHERE {{
   ?entity rdfs:label ?label .
-  FILTER (lang(?label) = "en")
+  FILTER (lang(?label) = "{lang}")
   FILTER CONTAINS(LCASE(STR(?label)), LCASE("{escaped_label}"))
-  OPTIONAL {{ ?entity dbo:abstract ?abstract FILTER (lang(?abstract) = "en") }}
+  OPTIONAL {{ ?entity dbo:abstract ?abstract FILTER (lang(?abstract) = "{lang}") }}
 }}
 LIMIT {bounded_limit}"#,
     )
@@ -134,7 +169,7 @@ mod tests {
 
     #[test]
     fn entity_lookup_builds_expected_sparql() {
-        let query = entity_query("Albert_Einstein");
+        let query = entity_query("Albert_Einstein", "en");
 
         assert!(query.contains("<http://dbpedia.org/resource/Albert_Einstein>"));
         assert!(query.contains("dbo:abstract"));
@@ -144,14 +179,14 @@ mod tests {
 
     #[test]
     fn entity_lookup_url_encodes_resource_segments() {
-        let query = entity_query("A B/C D");
+        let query = entity_query("A B/C D", "en");
 
         assert!(query.contains("<http://dbpedia.org/resource/A%20B/C%20D>"));
     }
 
     #[test]
     fn search_lookup_adds_bounded_limit() {
-        let query = search_query("Albert Einstein", 500);
+        let query = search_query("Albert Einstein", 500, "en");
 
         assert!(query.contains("CONTAINS(LCASE(STR(?label)), LCASE(\"Albert Einstein\"))"));
         assert!(query.contains("LIMIT 50"));
@@ -159,7 +194,7 @@ mod tests {
 
     #[test]
     fn search_lookup_escapes_quotes() {
-        let query = search_query("Ada \"Countess\" Lovelace", 10);
+        let query = search_query("Ada \"Countess\" Lovelace", 10, "en");
 
         assert!(query.contains("Ada \\\"Countess\\\" Lovelace"));
         assert!(query.contains("LIMIT 10"));
@@ -180,5 +215,16 @@ mod tests {
             error.to_string(),
             "dbpedia returned status 429 Too Many Requests"
         );
+    }
+
+    #[test]
+    fn generated_queries_use_requested_language() {
+        let entity = entity_query("Berlin", "de");
+        let search = search_query("Berlin", 10, "fr");
+
+        assert!(entity.contains("lang(?label) = \"de\""));
+        assert!(entity.contains("lang(?abstract) = \"de\""));
+        assert!(search.contains("lang(?label) = \"fr\""));
+        assert!(search.contains("lang(?abstract) = \"fr\""));
     }
 }

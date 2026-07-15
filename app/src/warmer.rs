@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use thiserror::Error;
+use tokio::{task::JoinHandle, time::MissedTickBehavior};
 
 use crate::{
     cache::{CachedEntry, ResponseCache},
@@ -16,6 +17,8 @@ pub struct PopularEntity {
     pub id: String,
     pub cache_key: String,
     pub hits: i64,
+    pub lang: String,
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +61,9 @@ impl PopularEntitySource for PostgresPopularEntitySource {
             SELECT
                 metadata->>'entity_id' AS entity_id,
                 query_hash,
-                COUNT(*) AS hits
+                COUNT(*) AS hits,
+                COALESCE(metadata->>'lang', 'en') AS lang,
+                metadata->>'endpoint' AS endpoint
             FROM request_logs
             WHERE route = 'entity'
               AND metadata ? 'entity_id'
@@ -77,6 +82,8 @@ impl PopularEntitySource for PostgresPopularEntitySource {
                 id: row.get("entity_id"),
                 cache_key: row.get("query_hash"),
                 hits: row.get("hits"),
+                lang: row.get("lang"),
+                endpoint: row.get("endpoint"),
             })
             .collect())
     }
@@ -125,7 +132,10 @@ impl CacheWarmer {
     }
 
     async fn refresh_entity(&self, entity: &PopularEntity) -> Result<(), WarmerError> {
-        let payload = self.origin.entity(&entity.id).await?;
+        let payload = self
+            .origin
+            .entity(&entity.id, entity.endpoint.as_deref(), &entity.lang)
+            .await?;
         let entry = CachedEntry::fresh(payload);
         let key = if entity.cache_key.is_empty() {
             cache_key::entity_key(&entity.id, &[("lang", "en")])
@@ -135,6 +145,34 @@ impl CacheWarmer {
 
         self.cache.set(&key, &entry, self.ttl).await?;
         Ok(())
+    }
+}
+
+pub fn spawn_cache_warmer(
+    warmer: Arc<CacheWarmer>,
+    interval: Duration,
+    top_k: i64,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        run_cache_warmer_loop(warmer, interval, top_k).await;
+    })
+}
+
+pub async fn run_cache_warmer_loop(warmer: Arc<CacheWarmer>, interval: Duration, top_k: i64) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        match warmer.warm_top_entities(top_k).await {
+            Ok(result) => tracing::info!(
+                refreshed = result.refreshed,
+                failed = result.failed,
+                top_k,
+                "cache warmer completed"
+            ),
+            Err(error) => tracing::warn!(%error, top_k, "cache warmer run failed"),
+        }
     }
 }
 
@@ -173,16 +211,30 @@ mod tests {
 
     #[async_trait]
     impl DbpediaClient for MockOrigin {
-        async fn entity(&self, id: &str) -> Result<Value, OriginError> {
+        async fn entity(
+            &self,
+            id: &str,
+            _endpoint_override: Option<&str>,
+            _lang: &str,
+        ) -> Result<Value, OriginError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(json!({ "id": id, "refreshed": true }))
         }
 
-        async fn search(&self, _query: &str) -> Result<Value, OriginError> {
+        async fn search(
+            &self,
+            _query: &str,
+            _endpoint_override: Option<&str>,
+            _lang: &str,
+        ) -> Result<Value, OriginError> {
             unreachable!("cache warmer should not search")
         }
 
-        async fn sparql(&self, _query: &str) -> Result<Value, OriginError> {
+        async fn sparql(
+            &self,
+            _query: &str,
+            _endpoint_override: Option<&str>,
+        ) -> Result<Value, OriginError> {
             unreachable!("cache warmer should not call raw sparql")
         }
     }
@@ -227,6 +279,8 @@ mod tests {
                 id: "Albert_Einstein".to_owned(),
                 cache_key: key.clone(),
                 hits: 7,
+                lang: "en".to_owned(),
+                endpoint: None,
             }],
         });
         let origin = Arc::new(MockOrigin::default());
@@ -257,11 +311,15 @@ mod tests {
                     id: "First".to_owned(),
                     cache_key: cache_key::entity_key("First", &[("lang", "en")]),
                     hits: 9,
+                    lang: "en".to_owned(),
+                    endpoint: None,
                 },
                 PopularEntity {
                     id: "Second".to_owned(),
                     cache_key: cache_key::entity_key("Second", &[("lang", "en")]),
                     hits: 8,
+                    lang: "en".to_owned(),
+                    endpoint: None,
                 },
             ],
         });
