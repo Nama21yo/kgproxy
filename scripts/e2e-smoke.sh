@@ -50,6 +50,7 @@ second_entity="$(mktemp)"
 sparql_response="$(mktemp)"
 metrics_response="$(mktemp)"
 dashboard_response="$(mktemp)"
+root_response="$(mktemp)"
 
 curl -fsS "${BASE_URL}/v1/entity/${ENTITY_ID}" >"${first_entity}"
 assert_contains "${first_entity}" '"cached":' "first entity"
@@ -68,5 +69,12 @@ assert_contains "${metrics_response}" '"total_requests":' "metrics"
 
 curl -fsS "${DASHBOARD_URL}/dashboard/" >"${dashboard_response}"
 assert_contains "${dashboard_response}" 'KGProxy Dashboard' "dashboard"
+
+curl -fsSI "${DASHBOARD_URL%/}/" >"${root_response}"
+if ! grep -qiE '^location: /dashboard/?' "${root_response}"; then
+  echo "Expected root URL to redirect to /dashboard/" >&2
+  cat "${root_response}" >&2
+  exit 1
+fi
 
 echo "E2E smoke passed: health, entity miss, entity hit, SPARQL passthrough, metrics, and dashboard all responded."
