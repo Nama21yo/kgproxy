@@ -47,7 +47,7 @@
   const endpointOptions = [
     { label: "Default DBpedia", value: "" },
     { label: "Main DBpedia", value: "https://dbpedia.org/sparql" },
-    { label: "Amharic DBpedia", value: "https://am.dbpedia.org/sparql" },
+    { label: "Amharic DBpedia", value: "https://am.dbpedia.data.dice-research.org/sparql" },
     { label: "German DBpedia", value: "https://de.dbpedia.org/sparql" },
     { label: "French DBpedia", value: "https://fr.dbpedia.org/sparql" }
   ];
@@ -83,6 +83,7 @@
   let sparqlSource = "idle";
   let activeTool: Tool = "entity";
   let copyState = "Copy JSON";
+  let exportState = "Export JSON";
 
   $: isHealthy = health.status === "ok";
   $: serviceStatus = health.status ?? "waiting";
@@ -187,6 +188,7 @@
       second: "2-digit"
     });
     copyState = "Copy JSON";
+    exportState = "Export JSON";
   }
 
   function sourceFrom(payload: ApiEnvelope) {
@@ -336,23 +338,49 @@
   async function copyResponse() {
     try {
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(responseText);
+        try {
+          await navigator.clipboard.writeText(responseText);
+        } catch {
+          copyWithFallback();
+        }
       } else {
-        const copyArea = document.createElement("textarea");
-        copyArea.value = responseText;
-        copyArea.setAttribute("readonly", "");
-        copyArea.style.position = "fixed";
-        copyArea.style.opacity = "0";
-        document.body.appendChild(copyArea);
-        copyArea.select();
-        const copied = document.execCommand("copy");
-        copyArea.remove();
-        if (!copied) throw new Error("Copy command was rejected");
+        copyWithFallback();
       }
       copyState = "Copied";
       window.setTimeout(() => (copyState = "Copy JSON"), 1600);
     } catch {
       copyState = "Copy unavailable";
+    }
+  }
+
+  function copyWithFallback() {
+    const copyArea = document.createElement("textarea");
+    copyArea.value = responseText;
+    copyArea.setAttribute("readonly", "");
+    copyArea.style.position = "fixed";
+    copyArea.style.opacity = "0";
+    document.body.appendChild(copyArea);
+    copyArea.select();
+    const copied = document.execCommand("copy");
+    copyArea.remove();
+    if (!copied) throw new Error("Copy command was rejected");
+  }
+
+  function exportResponse() {
+    try {
+      const blob = new Blob([responseText], { type: "application/json;charset=utf-8" });
+      const downloadUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = "kgproxy-response.json";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(downloadUrl);
+      exportState = "Exported";
+      window.setTimeout(() => (exportState = "Export JSON"), 1600);
+    } catch {
+      exportState = "Export unavailable";
     }
   }
 
@@ -572,7 +600,10 @@
             <section id="response" class="response-card">
               <div class="response-heading">
                 <div><div class="eyebrow">Your result</div><h2>Answer</h2></div>
-                <button class="copy-button" type="button" on:click={copyResponse}>{copyState} <span>⧉</span></button>
+                <div class="response-actions">
+                  <button class="copy-button" type="button" on:click={copyResponse}>{copyState} <span>⧉</span></button>
+                  <button class="export-button" type="button" on:click={exportResponse}>{exportState} <span>↓</span></button>
+                </div>
               </div>
               <div class="response-panel">
                 <div class="response-bar">
@@ -616,20 +647,30 @@
       </section>
 
       <section id="traffic" class="content-section">
-        <div class="section-heading">
-          <div>
+        <div class="activity-header">
+          <div class="activity-title">
             <div class="eyebrow">What people asked recently</div>
             <h2>Recent activity</h2>
             <p class="section-description traffic-description">Each point represents one hour. Quiet hours stay visible, so the shape reflects the full day.</p>
           </div>
-          <div class="heading-meta">
-            <span class="legend"><i class="legend-line"></i> questions per hour</span>
-            <span class="mono-label">LAST 24 HOURS</span>
+          <div class="activity-summary" aria-label="Recent activity summary">
+            <div class="activity-stat">
+              <strong>{number(metrics.total_requests)}</strong>
+              <span>questions in 24 hours</span>
+            </div>
+            <div class="activity-stat">
+              <strong>{number(busiestHour?.total_requests)}</strong>
+              <span>busiest hour</span>
+            </div>
           </div>
         </div>
 
         <div class="traffic-panel">
           {#if trafficPoints.length}
+            <div class="chart-label-row">
+              <span class="legend"><i class="legend-line"></i> questions per hour</span>
+              <span class="mono-label">LAST 24 HOURS</span>
+            </div>
             <div class="chart-wrap">
               <div class="chart-y-labels"><span>{number(historyMax)}</span><span>{number(Math.round(historyMax / 2))}</span><span>0</span></div>
               <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Questions asked each hour">
