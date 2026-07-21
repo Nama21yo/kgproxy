@@ -1,0 +1,109 @@
+name: CI and deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kgproxy-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify backend and frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path app/Cargo.toml -- --check
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path app/Cargo.toml
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+
+      - name: Check frontend
+        working-directory: frontend
+        run: bun run check
+
+      - name: Build frontend
+        working-directory: frontend
+        run: bun run build
+
+      - name: Validate Compose configuration
+        run: docker compose config
+
+  deploy:
+    name: Deploy to EC2 through Systems Manager
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+
+      - name: Run deployment on EC2
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          cat > /tmp/ssm-command.json <<JSON
+          {
+            "DocumentName": "AWS-RunShellScript",
+            "InstanceIds": ["${INSTANCE_ID}"],
+            "Parameters": {
+              "commands": [
+                "sudo -u ubuntu -H bash -lc '/opt/kgproxy/scripts/deploy-ec2.sh'"
+              ]
+            },
+            "Comment": "KGProxy deployment from GitHub Actions"
+          }
+          JSON
+
+          command_id="$(aws ssm send-command \
+            --cli-input-json file:///tmp/ssm-command.json \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          aws ssm wait command-executed \
+            --command-id "${command_id}" \
+            --instance-id "${INSTANCE_ID}"
+
+          status="$(aws ssm get-command-invocation \
+            --command-id "${command_id}" \
+            --instance-id "${INSTANCE_ID}" \
+            --query 'Status' \
+            --output text)"
+
+          aws ssm get-command-invocation \
+            --command-id "${command_id}" \
+            --instance-id "${INSTANCE_ID}" \
+            --query '{status:Status,output:StandardOutputContent,error:StandardErrorContent}'
+
+          test "${status}" = "Success"
+

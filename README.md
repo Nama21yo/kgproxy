@@ -80,6 +80,17 @@ The dashboard is served by Nginx at:
 http://127.0.0.1:8081/dashboard/
 ```
 
+The root URL redirects to the dashboard:
+
+```bash
+http://127.0.0.1:8081/
+```
+
+For AWS deployment, see [`docs/deploy-aws.md`](docs/deploy-aws.md). After the
+initial manual setup, GitHub Actions can deploy changes pushed to `main` using
+AWS Systems Manager. The CI/CD setup is documented in
+[`docs/ci-cd-aws.md`](docs/ci-cd-aws.md).
+
 Nginx forwards `X-Real-IP` and `X-Forwarded-For`; KGProxy hashes the selected
 client identifier before writing request logs to PostgreSQL.
 
