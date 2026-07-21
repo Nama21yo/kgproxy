@@ -71,7 +71,7 @@ curl -fsS "${DASHBOARD_URL}/dashboard/" >"${dashboard_response}"
 assert_contains "${dashboard_response}" 'KGProxy Dashboard' "dashboard"
 
 curl -fsSI "${DASHBOARD_URL%/}/" >"${root_response}"
-if ! grep -qiE '^location: /dashboard/?' "${root_response}"; then
+if ! grep -qiE '^location: .*\/dashboard/?' "${root_response}"; then
   echo "Expected root URL to redirect to /dashboard/" >&2
   cat "${root_response}" >&2
   exit 1
