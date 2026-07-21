@@ -166,7 +166,31 @@ i-08488fefebe5f2044
 No AWS access key, AWS secret key, SSH private key, or database password is
 needed in GitHub. The production .env file remains on EC2.
 
-## 5. Test the workflow
+## 5. Configure deployment URLs
+
+In the same **Settings → Secrets and variables → Actions** page, open the
+**Variables** tab and create:
+
+~~~text
+DEPLOY_BASE_URL
+DEPLOY_DASHBOARD_URL
+~~~
+
+While the domain and HTTPS are not ready, use the Elastic IP for both values:
+
+~~~text
+DEPLOY_BASE_URL=http://44.194.182.146
+DEPLOY_DASHBOARD_URL=http://44.194.182.146
+~~~
+
+After `kgproxy.io` DNS and Let's Encrypt are working, change both values to:
+
+~~~text
+DEPLOY_BASE_URL=https://kgproxy.io
+DEPLOY_DASHBOARD_URL=https://kgproxy.io
+~~~
+
+## 6. Test the workflow
 
 After the workflow is pushed:
 

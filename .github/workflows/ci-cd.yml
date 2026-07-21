@@ -71,14 +71,16 @@ jobs:
       - name: Run deployment on EC2
         env:
           INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          DEPLOY_BASE_URL: ${{ vars.DEPLOY_BASE_URL }}
+          DEPLOY_DASHBOARD_URL: ${{ vars.DEPLOY_DASHBOARD_URL }}
         run: |
           cat > /tmp/ssm-command.json <<JSON
           {
             "DocumentName": "AWS-RunShellScript",
-            "InstanceIds": ["${INSTANCE_ID}"],
-            "Parameters": {
-              "commands": [
-                "sudo -u ubuntu -H bash -lc '/opt/kgproxy/scripts/deploy-ec2.sh'"
+              "InstanceIds": ["${INSTANCE_ID}"],
+              "Parameters": {
+                "commands": [
+                "sudo -u ubuntu -H env DEPLOY_BASE_URL='${DEPLOY_BASE_URL}' DEPLOY_DASHBOARD_URL='${DEPLOY_DASHBOARD_URL}' bash -lc '/opt/kgproxy/scripts/deploy-ec2.sh'"
               ]
             },
             "Comment": "KGProxy deployment from GitHub Actions"
@@ -106,4 +108,3 @@ jobs:
             --query '{status:Status,output:StandardOutputContent,error:StandardErrorContent}'
 
           test "${status}" = "Success"
-
