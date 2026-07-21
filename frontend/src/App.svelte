@@ -1,4 +1,8 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import uPlot from "uplot";
+  import "uplot/dist/uPlot.min.css";
+
   type Health = {
     status?: string;
     service?: string;
@@ -97,9 +101,6 @@
       : "—";
   $: historyPoints = timeseries.points ?? [];
   $: trafficPoints = fillTrafficGaps(historyPoints, timeseries.bucket_seconds ?? 3_600);
-  $: historyPolyline = chartPolyline(trafficPoints);
-  $: historyArea = historyPolyline ? historyPolyline + " 100,100 0,100" : "";
-  $: historyMax = Math.max(1, ...trafficPoints.map((point) => point.total_requests));
   $: busiestHour = trafficPoints.length
     ? trafficPoints.reduce((best, point) => point.total_requests > best.total_requests ? point : best, trafficPoints[0])
     : undefined;
@@ -116,6 +117,9 @@
           : responseSource === "error"
             ? "Request needs attention"
             : "Response inspector";
+
+  let activityChartElement: HTMLDivElement;
+  let activityChart: uPlot | undefined;
 
   function apiUrl(path: string) {
     const base = apiBase.trim().replace(/\/$/, "");
@@ -144,18 +148,6 @@
     return JSON.stringify(payload, null, 2);
   }
 
-  function chartPolyline(points: MetricsPoint[]) {
-    if (!points.length) return "";
-    const max = Math.max(1, ...points.map((item) => item.total_requests));
-    return points
-      .map((point, index) => {
-        const x = points.length === 1 ? 50 : (index / (points.length - 1)) * 100;
-        const y = 100 - (point.total_requests / max) * 82 - 9;
-        return x.toFixed(2) + "," + y.toFixed(2);
-      })
-      .join(" ");
-  }
-
   function fillTrafficGaps(points: MetricsPoint[], bucketSeconds: number) {
     if (!points.length) return [];
     const sorted = [...points].sort((a, b) => a.observed_at_unix_secs - b.observed_at_unix_secs);
@@ -172,6 +164,79 @@
     }
     return filled;
   }
+
+  function updateActivityChart() {
+    if (!activityChartElement || !trafficPoints.length) return;
+    const data: uPlot.AlignedData = [
+      trafficPoints.map((point) => point.observed_at_unix_secs),
+      trafficPoints.map((point) => point.total_requests)
+    ];
+
+    if (activityChart) {
+      activityChart.setData(data);
+      return;
+    }
+
+    activityChart = new uPlot(
+      {
+        width: Math.max(280, activityChartElement.clientWidth),
+        height: 250,
+        padding: [12, 12, 8, 4],
+        scales: {
+          x: { time: true },
+          y: { range: (_self, min, max) => [0, Math.max(1, max * 1.15)] }
+        },
+        axes: [
+          {
+            stroke: "#80908b",
+            grid: { stroke: "rgba(16, 33, 43, 0.09)", width: 1 },
+            ticks: { stroke: "rgba(16, 33, 43, 0.12)", width: 1 },
+            font: "11px IBM Plex Mono, monospace",
+            space: 72,
+            values: (_self, values) => values.map((value) => formatBucket(Number(value)))
+          },
+          {
+            stroke: "#80908b",
+            grid: { stroke: "rgba(16, 33, 43, 0.09)", width: 1 },
+            ticks: { stroke: "rgba(16, 33, 43, 0.12)", width: 1 },
+            font: "11px IBM Plex Mono, monospace",
+            size: 44,
+            values: (_self, values) => values.map((value) => number(Number(value)))
+          }
+        ],
+        series: [
+          {},
+          {
+            label: "Questions",
+            stroke: "#279e9c",
+            width: 2,
+            fill: "rgba(103, 214, 207, 0.18)",
+            points: { show: true, size: 5, fill: "#279e9c", stroke: "#fbfaf6", width: 2 }
+          }
+        ],
+        cursor: { drag: { x: false, y: false } },
+        legend: { show: false }
+      },
+      data,
+      activityChartElement
+    );
+  }
+
+  onMount(() => {
+    const resizeObserver = new ResizeObserver(() => {
+      if (activityChart && activityChartElement) {
+        activityChart.setSize({ width: Math.max(280, activityChartElement.clientWidth), height: 250 });
+      }
+    });
+
+    if (activityChartElement) resizeObserver.observe(activityChartElement);
+    return () => {
+      resizeObserver.disconnect();
+      activityChart?.destroy();
+    };
+  });
+
+  $: if (activityChartElement && trafficPoints.length) updateActivityChart();
 
   function formatBucket(unixSeconds: number) {
     return new Date(unixSeconds * 1000).toLocaleTimeString([], {
@@ -672,14 +737,7 @@
               <span class="mono-label">LAST 24 HOURS</span>
             </div>
             <div class="chart-wrap">
-              <div class="chart-y-labels"><span>{number(historyMax)}</span><span>{number(Math.round(historyMax / 2))}</span><span>0</span></div>
-              <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Questions asked each hour">
-                <line class="chart-grid" x1="0" y1="9" x2="100" y2="9" />
-                <line class="chart-grid" x1="0" y1="50" x2="100" y2="50" />
-                <line class="chart-grid" x1="0" y1="91" x2="100" y2="91" />
-                <polygon class="chart-area" points={historyArea} />
-                <polyline class="chart-line" points={historyPolyline} />
-              </svg>
+              <div class="activity-chart" bind:this={activityChartElement} role="img" aria-label="Questions asked each hour"></div>
             </div>
             <div class="chart-footer">
               <span>{formatBucket(trafficPoints[0].observed_at_unix_secs)}</span>

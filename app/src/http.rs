@@ -517,9 +517,12 @@ fn validate_endpoint_override(endpoint: Option<String>) -> Result<Option<String>
     if url.scheme() != "https" {
         return Err(ApiError::BadRequest("endpoint must use https".to_owned()));
     }
-    if host != "dbpedia.org" && !host.ends_with(".dbpedia.org") {
+    let is_dbpedia_endpoint = host == "dbpedia.org"
+        || host.ends_with(".dbpedia.org")
+        || host == "am.dbpedia.data.dice-research.org";
+    if !is_dbpedia_endpoint {
         return Err(ApiError::BadRequest(
-            "endpoint must be dbpedia.org or a dbpedia.org subdomain".to_owned(),
+            "endpoint must be an approved DBpedia endpoint".to_owned(),
         ));
     }
     if url.path() != "/sparql" {
@@ -1208,6 +1211,23 @@ mod tests {
         assert_eq!(json["data"]["kind"], "entity");
         assert_eq!(json["data"]["id"], "Berlin");
         assert_eq!(json["data"]["endpoint"], "https://de.dbpedia.org/sparql");
+    }
+
+    #[tokio::test]
+    async fn entity_route_accepts_amharic_dbpedia_endpoint_override() {
+        let json = request_json(
+            Request::builder()
+                .uri("/v1/entity/Albert_Einstein?endpoint=https%3A%2F%2Fam.dbpedia.data.dice-research.org%2Fsparql&lang=am")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(json["data"]["lang"], "am");
+        assert_eq!(
+            json["data"]["endpoint"],
+            "https://am.dbpedia.data.dice-research.org/sparql"
+        );
     }
 
     #[tokio::test]
