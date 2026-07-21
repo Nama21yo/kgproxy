@@ -80,7 +80,7 @@ jobs:
               "InstanceIds": ["${INSTANCE_ID}"],
               "Parameters": {
                 "commands": [
-                "sudo -u ubuntu -H env DEPLOY_BASE_URL='${DEPLOY_BASE_URL}' DEPLOY_DASHBOARD_URL='${DEPLOY_DASHBOARD_URL}' bash -lc '/opt/kgproxy/scripts/deploy-ec2.sh'"
+                "sudo -u ubuntu -H env DEPLOY_BASE_URL='${DEPLOY_BASE_URL}' DEPLOY_DASHBOARD_URL='${DEPLOY_DASHBOARD_URL}' bash -lc 'cd /opt/kgproxy && git switch main && git pull --ff-only origin main && /opt/kgproxy/scripts/deploy-ec2.sh'"
               ]
             },
             "Comment": "KGProxy deployment from GitHub Actions"
@@ -92,9 +92,12 @@ jobs:
             --query 'Command.CommandId' \
             --output text)"
 
+          set +e
           aws ssm wait command-executed \
             --command-id "${command_id}" \
             --instance-id "${INSTANCE_ID}"
+          waiter_status=$?
+          set -e
 
           status="$(aws ssm get-command-invocation \
             --command-id "${command_id}" \
@@ -107,4 +110,5 @@ jobs:
             --instance-id "${INSTANCE_ID}" \
             --query '{status:Status,output:StandardOutputContent,error:StandardErrorContent}'
 
+          echo "SSM waiter exit code: ${waiter_status}"
           test "${status}" = "Success"
