@@ -26,6 +26,8 @@ cd "${APP_DIR}"
 
 docker compose -f docker-compose.yml -f docker-compose.prod.yml config >/dev/null
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T nginx nginx -t
+docker compose -f docker-compose.yml -f docker-compose.prod.yml restart nginx
 
 BASE_URL="${BASE_URL}" \
 DASHBOARD_URL="${DASHBOARD_URL}" \
