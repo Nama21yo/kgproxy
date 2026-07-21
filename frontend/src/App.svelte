@@ -47,6 +47,7 @@
   const endpointOptions = [
     { label: "Default DBpedia", value: "" },
     { label: "Main DBpedia", value: "https://dbpedia.org/sparql" },
+    { label: "Amharic DBpedia", value: "https://am.dbpedia.org/sparql" },
     { label: "German DBpedia", value: "https://de.dbpedia.org/sparql" },
     { label: "French DBpedia", value: "https://fr.dbpedia.org/sparql" }
   ];
@@ -94,9 +95,13 @@
       ? health.outbound_available_permits + "/" + health.max_outbound_concurrency
       : "—";
   $: historyPoints = timeseries.points ?? [];
-  $: historyPolyline = chartPolyline(historyPoints);
+  $: trafficPoints = fillTrafficGaps(historyPoints, timeseries.bucket_seconds ?? 3_600);
+  $: historyPolyline = chartPolyline(trafficPoints);
   $: historyArea = historyPolyline ? historyPolyline + " 100,100 0,100" : "";
-  $: historyMax = Math.max(1, ...historyPoints.map((point) => point.total_requests));
+  $: historyMax = Math.max(1, ...trafficPoints.map((point) => point.total_requests));
+  $: busiestHour = trafficPoints.length
+    ? trafficPoints.reduce((best, point) => point.total_requests > best.total_requests ? point : best, trafficPoints[0])
+    : undefined;
   $: responseText = pretty(responsePayload);
   $: responseBytes = new TextEncoder().encode(responseText).length;
   $: responseSource = sourceFrom(responsePayload as ApiEnvelope);
@@ -148,6 +153,23 @@
         return x.toFixed(2) + "," + y.toFixed(2);
       })
       .join(" ");
+  }
+
+  function fillTrafficGaps(points: MetricsPoint[], bucketSeconds: number) {
+    if (!points.length) return [];
+    const sorted = [...points].sort((a, b) => a.observed_at_unix_secs - b.observed_at_unix_secs);
+    const byBucket = new Map(sorted.map((point) => [point.observed_at_unix_secs, point]));
+    const filled: MetricsPoint[] = [];
+    for (let timestamp = sorted[0].observed_at_unix_secs; timestamp <= sorted[sorted.length - 1].observed_at_unix_secs; timestamp += bucketSeconds) {
+      filled.push(byBucket.get(timestamp) ?? {
+        observed_at_unix_secs: timestamp,
+        total_requests: 0,
+        cache_hit_rate: 0,
+        stale_response_rate: 0,
+        p95_latency_ms: 0
+      });
+    }
+    return filled;
   }
 
   function formatBucket(unixSeconds: number) {
@@ -313,7 +335,20 @@
 
   async function copyResponse() {
     try {
-      await navigator.clipboard.writeText(responseText);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(responseText);
+      } else {
+        const copyArea = document.createElement("textarea");
+        copyArea.value = responseText;
+        copyArea.setAttribute("readonly", "");
+        copyArea.style.position = "fixed";
+        copyArea.style.opacity = "0";
+        document.body.appendChild(copyArea);
+        copyArea.select();
+        const copied = document.execCommand("copy");
+        copyArea.remove();
+        if (!copied) throw new Error("Copy command was rejected");
+      }
       copyState = "Copied";
       window.setTimeout(() => (copyState = "Copy JSON"), 1600);
     } catch {
@@ -325,6 +360,14 @@
     document.getElementById("query-lab")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
+  function chooseLanguage(language: string) {
+    entityLanguage = language;
+    searchLanguage = language;
+    entityEndpoint = "";
+    searchEndpoint = "";
+    activeTool = "entity";
+  }
+
   refreshDashboard();
 </script>
 
@@ -332,7 +375,7 @@
   <title>KGProxy / Edge observatory</title>
   <meta
     name="description"
-    content="Explore DBpedia through KGProxy's cache, routing, and reliability controls."
+    content="Explore people, places, and ideas from DBpedia in a clear, friendly dashboard."
   />
 </svelte:head>
 
@@ -359,7 +402,7 @@
       </a>
       <a class="nav-item" href="#traffic">
         <span class="nav-icon">⌁</span>
-        Traffic pulse
+        Recent activity
       </a>
       <a class="nav-item" href="#query-lab">
         <span class="nav-icon">⌘</span>
@@ -373,8 +416,8 @@
 
     <div class="sidebar-note">
       <span class="note-rule"></span>
-      <p>DBpedia access with a memory.</p>
-      <small>Cache · limits · fallbacks</small>
+      <p>Ask DBpedia a question and see a clear answer.</p>
+      <small>English · አማርኛ · more languages</small>
     </div>
 
     <div class="sidebar-footer">
@@ -414,44 +457,137 @@
           <div class="eyebrow"><span class="eyebrow-mark"></span> DBpedia reliability gateway</div>
           <h1>DBpedia,<br /><em>with a safer edge.</em></h1>
           <p class="hero-lede">
-            A transparent control room for cached lookups, language-aware routing,
-            and graceful origin failures.
+            Look up people, places, and ideas from DBpedia. Try a question below,
+            then see where your answer came from.
           </p>
+          <div class="language-strip" aria-label="Available DBpedia languages">
+            <span class="language-label">Try DBpedia in</span>
+            <button class:active={entityLanguage === "en"} type="button" on:click={() => chooseLanguage("en")}>English</button>
+            <button class:active={entityLanguage === "am"} type="button" on:click={() => chooseLanguage("am")}>አማርኛ</button>
+            <button class:active={entityLanguage === "de"} type="button" on:click={() => chooseLanguage("de")}>Deutsch</button>
+            <button class:active={entityLanguage === "fr"} type="button" on:click={() => chooseLanguage("fr")}>Français</button>
+          </div>
           <div class="hero-actions">
             <button class="primary-button" type="button" on:click={focusLab}>
               Open query lab
               <span>↗</span>
             </button>
-            <a class="text-button" href="#traffic">See traffic pulse <span>↓</span></a>
+            <a class="text-button" href="#traffic">See recent activity <span>↓</span></a>
           </div>
         </div>
 
         <div class="route-card" aria-label="KGProxy request path">
           <div class="route-card-top">
-            <span class="mono-label">REQUEST PATH / LIVE</span>
+            <span class="mono-label">HOW YOUR ANSWER ARRIVES</span>
             <span class="route-time">{lastUpdated}</span>
           </div>
           <div class="route-map">
             <div class="route-line"><span class="route-travel"></span></div>
             <div class="route-node client-node">
               <span class="node-glyph">⌁</span>
-              <strong>Client</strong>
-              <small>request</small>
+              <strong>You ask</strong>
+              <small>your question</small>
             </div>
             <div class="route-node cache-node">
               <span class="node-glyph">◌</span>
-              <strong>Redis</strong>
-              <small>cache layer</small>
+              <strong>KGProxy</strong>
+              <small>finds an answer</small>
             </div>
             <div class="route-node origin-node">
               <span class="node-glyph">✦</span>
               <strong>DBpedia</strong>
-              <small>origin</small>
+              <small>knowledge source</small>
             </div>
           </div>
           <div class="route-caption">
             <span class="caption-dot"></span>
-            <span>Requests stay observable from edge to origin.</span>
+            <span>The path stays visible, so every answer is easy to understand.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="query-lab" class="content-section query-section">
+        <div class="section-heading query-heading">
+          <div>
+            <div class="eyebrow">Start here</div>
+            <h2>Ask DBpedia</h2>
+            <p class="section-description query-description">Choose a simple lookup, search for a topic, or write a question. Your answer will appear beside this form.</p>
+          </div>
+        </div>
+
+        <div class="query-layout">
+          <div class="lab-panel">
+            <div class="lab-tabs" role="tablist" aria-label="Ways to ask DBpedia">
+              <button class:active={activeTool === "entity"} type="button" role="tab" aria-selected={activeTool === "entity"} on:click={() => (activeTool = "entity")}>
+                <span>01</span> Look up a thing
+              </button>
+              <button class:active={activeTool === "search"} type="button" role="tab" aria-selected={activeTool === "search"} on:click={() => (activeTool = "search")}>
+                <span>02</span> Search a topic
+              </button>
+              <button class:active={activeTool === "sparql"} type="button" role="tab" aria-selected={activeTool === "sparql"} on:click={() => (activeTool = "sparql")}>
+                <span>03</span> Advanced query
+              </button>
+            </div>
+
+            {#if activeTool === "entity"}
+              <form class="tool-form" on:submit|preventDefault={runEntity}>
+                <div class="tool-heading">
+                  <div><span class="tool-kicker">LOOK UP A THING</span><h3>Find a person, place, or idea</h3></div>
+                  <span class:state-origin={entitySource === "origin"} class:state-cache={entitySource === "cache"} class:state-stale={entitySource === "stale"} class:state-error={entitySource === "error"} class:state-loading={entitySource === "loading"} class="source-badge">{sourceLabel(entitySource)}</span>
+                </div>
+                <label class="field wide-field"><span>What should we look up?</span><input bind:value={entityId} autocomplete="off" placeholder="Albert_Einstein" /></label>
+                <div class="field-row">
+                  <label class="field"><span>Knowledge base</span><select bind:value={entityEndpoint}>{#each endpointOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+                  <label class="field"><span>Language</span><select bind:value={entityLanguage}>{#each languageOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+                </div>
+                <div class="form-footer"><span class="field-hint">Example: use underscores between words, like Albert_Einstein.</span><button class="run-button" type="submit" disabled={entityLoading}>{entityLoading ? "Finding answer..." : "Find answer"} <span>↗</span></button></div>
+              </form>
+            {:else if activeTool === "search"}
+              <form class="tool-form" on:submit|preventDefault={runSearch}>
+                <div class="tool-heading">
+                  <div><span class="tool-kicker">SEARCH A TOPIC</span><h3>Explore a subject in DBpedia</h3></div>
+                  <span class:state-origin={searchSource === "origin"} class:state-cache={searchSource === "cache"} class:state-stale={searchSource === "stale"} class:state-error={searchSource === "error"} class:state-loading={searchSource === "loading"} class="source-badge">{sourceLabel(searchSource)}</span>
+                </div>
+                <label class="field wide-field"><span>What are you curious about?</span><input bind:value={searchQuery} autocomplete="off" placeholder="Ethiopia" /></label>
+                <div class="field-row">
+                  <label class="field"><span>Knowledge base</span><select bind:value={searchEndpoint}>{#each endpointOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+                  <label class="field"><span>Language</span><select bind:value={searchLanguage}>{#each languageOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+                </div>
+                <div class="form-footer"><span class="field-hint">Try a country, city, person, or subject.</span><button class="run-button" type="submit" disabled={searchLoading}>{searchLoading ? "Searching..." : "Search"} <span>↗</span></button></div>
+              </form>
+            {:else}
+              <form class="tool-form" on:submit|preventDefault={runSparql}>
+                <div class="tool-heading">
+                  <div><span class="tool-kicker">ADVANCED QUERY</span><h3>Use a custom DBpedia question</h3></div>
+                  <span class:state-origin={sparqlSource === "origin"} class:state-cache={sparqlSource === "cache"} class:state-stale={sparqlSource === "stale"} class:state-error={sparqlSource === "error"} class:state-loading={sparqlSource === "loading"} class="source-badge">{sourceLabel(sparqlSource)}</span>
+                </div>
+                <label class="field wide-field"><span>Knowledge base</span><select bind:value={sparqlEndpoint}>{#each endpointOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
+                <label class="field wide-field"><span>Your question</span><textarea bind:value={sparqlQuery} spellcheck="false" placeholder="SELECT * WHERE &#123; ?s ?p ?o &#125; LIMIT 5"></textarea></label>
+                <div class="form-footer"><span class="field-hint">For users familiar with DBpedia's query language.</span><button class="run-button" type="submit" disabled={sparqlLoading}>{sparqlLoading ? "Running..." : "Run query"} <span>↗</span></button></div>
+              </form>
+            {/if}
+          </div>
+
+          <div class="response-column">
+            <section id="response" class="response-card">
+              <div class="response-heading">
+                <div><div class="eyebrow">Your result</div><h2>Answer</h2></div>
+                <button class="copy-button" type="button" on:click={copyResponse}>{copyState} <span>⧉</span></button>
+              </div>
+              <div class="response-panel">
+                <div class="response-bar">
+                  <div><span class:state-origin={responseSource === "origin"} class:state-cache={responseSource === "cache"} class:state-stale={responseSource === "stale"} class:state-error={responseSource === "error"} class="source-badge">{sourceLabel(responseSource)}</span><strong>{sourceTitle}</strong></div>
+                  <span class="response-size">{responseBytes.toLocaleString()} bytes</span>
+                </div>
+                <pre>{responseText}</pre>
+              </div>
+              <p class="response-help">The label above tells you how this answer was found. “Redis cache” means KGProxy already had the answer ready; “DBpedia origin” means it looked it up just now.</p>
+            </section>
+            <aside class="usage-panel plain-usage">
+              <div class="usage-header"><span class="usage-symbol">✦</span><div><span class="tool-kicker">QUICK START</span><h3>Try an example</h3></div></div>
+              <p class="usage-intro">Start with one of these examples, then change the words to explore.</p>
+              <div class="example-chips"><button type="button" on:click={() => chooseExample("entity", "Albert_Einstein")}>Albert Einstein</button><button type="button" on:click={() => chooseExample("search", "Ethiopia")}>Ethiopia</button><button type="button" on:click={() => chooseExample("sparql", "SELECT ?s WHERE { ?s a <http://dbpedia.org/ontology/City> } LIMIT 5")}>Cities</button></div>
+            </aside>
           </div>
         </div>
       </section>
@@ -463,39 +599,40 @@
           <div class="metric-foot"><span>breaker</span><strong>{breakerLabel}</strong></div>
         </article>
         <article class="metric-card metric-requests">
-          <div class="metric-top"><span class="metric-label">Requests / 24h</span><span class="metric-index">02</span></div>
+          <div class="metric-top"><span class="metric-label">Questions today</span><span class="metric-index">02</span></div>
           <div class="metric-value">{number(metrics.total_requests)}</div>
-          <div class="metric-foot"><span>latest bucket</span><strong>{historyPoints.length ? number(historyPoints[historyPoints.length - 1].total_requests) : "—"}</strong></div>
+          <div class="metric-foot"><span>latest hour</span><strong>{trafficPoints.length ? number(trafficPoints[trafficPoints.length - 1].total_requests) : "—"}</strong></div>
         </article>
         <article class="metric-card metric-cache">
-          <div class="metric-top"><span class="metric-label">Cache hit rate</span><span class="metric-index">03</span></div>
+          <div class="metric-top"><span class="metric-label">Fast repeat answers</span><span class="metric-index">03</span></div>
           <div class="metric-value">{percent(metrics.cache_hit_rate)}</div>
-          <div class="metric-foot"><span>Redis hits</span><strong>{number(metrics.cache_hits)}</strong></div>
+          <div class="metric-foot"><span>previously answered</span><strong>{number(metrics.cache_hits)}</strong></div>
         </article>
         <article class="metric-card metric-latency">
-          <div class="metric-top"><span class="metric-label">P95 latency</span><span class="metric-index">04</span></div>
+          <div class="metric-top"><span class="metric-label">Typical response</span><span class="metric-index">04</span></div>
           <div class="metric-value">{number(metrics.p95_latency_ms)}<small>ms</small></div>
-          <div class="metric-foot"><span>permits</span><strong>{permitsLabel}</strong></div>
+          <div class="metric-foot"><span>last 24 hours</span><strong>{number(metrics.origin_errors)} issues</strong></div>
         </article>
       </section>
 
       <section id="traffic" class="content-section">
         <div class="section-heading">
           <div>
-            <div class="eyebrow">Signal over time</div>
-            <h2>Traffic pulse</h2>
+            <div class="eyebrow">What people asked recently</div>
+            <h2>Recent activity</h2>
+            <p class="section-description traffic-description">Each point represents one hour. Quiet hours stay visible, so the shape reflects the full day.</p>
           </div>
           <div class="heading-meta">
-            <span class="legend"><i class="legend-line"></i> request volume</span>
+            <span class="legend"><i class="legend-line"></i> questions per hour</span>
             <span class="mono-label">LAST 24 HOURS</span>
           </div>
         </div>
 
         <div class="traffic-panel">
-          {#if historyPoints.length}
+          {#if trafficPoints.length}
             <div class="chart-wrap">
               <div class="chart-y-labels"><span>{number(historyMax)}</span><span>{number(Math.round(historyMax / 2))}</span><span>0</span></div>
-              <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Request volume over time">
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Questions asked each hour">
                 <line class="chart-grid" x1="0" y1="9" x2="100" y2="9" />
                 <line class="chart-grid" x1="0" y1="50" x2="100" y2="50" />
                 <line class="chart-grid" x1="0" y1="91" x2="100" y2="91" />
@@ -504,113 +641,25 @@
               </svg>
             </div>
             <div class="chart-footer">
-              <span>{formatBucket(historyPoints[0].observed_at_unix_secs)}</span>
-              <strong>{number(historyPoints[historyPoints.length - 1].total_requests)} requests in latest bucket</strong>
-              <span>{formatBucket(historyPoints[historyPoints.length - 1].observed_at_unix_secs)}</span>
+              <span>{formatBucket(trafficPoints[0].observed_at_unix_secs)}</span>
+              <strong>{number(busiestHour?.total_requests)} questions at {busiestHour ? formatBucket(busiestHour.observed_at_unix_secs) : "—"}</strong>
+              <span>{formatBucket(trafficPoints[trafficPoints.length - 1].observed_at_unix_secs)}</span>
             </div>
           {:else}
             <div class="empty-state">
               <span class="empty-glyph">⌁</span>
-              <strong>No traffic history yet</strong>
-              <span>Run a lookup or search below to seed the pulse.</span>
+              <strong>No recent activity yet</strong>
+              <span>Ask your first question above and it will appear here.</span>
             </div>
           {/if}
         </div>
       </section>
 
-      <section id="query-lab" class="content-section">
-        <div class="section-heading">
-          <div>
-            <div class="eyebrow">Try the edge</div>
-            <h2>Query lab</h2>
-          </div>
-          <span class="section-description">Use real requests to see cache and origin behavior.</span>
-        </div>
-
-        <div class="lab-grid">
-          <div class="lab-panel">
-            <div class="lab-tabs" role="tablist" aria-label="Query tools">
-              <button class:active={activeTool === "entity"} type="button" role="tab" aria-selected={activeTool === "entity"} on:click={() => (activeTool = "entity")}>
-                <span>01</span> Entity
-              </button>
-              <button class:active={activeTool === "search"} type="button" role="tab" aria-selected={activeTool === "search"} on:click={() => (activeTool = "search")}>
-                <span>02</span> Search
-              </button>
-              <button class:active={activeTool === "sparql"} type="button" role="tab" aria-selected={activeTool === "sparql"} on:click={() => (activeTool = "sparql")}>
-                <span>03</span> SPARQL
-              </button>
-            </div>
-
-            {#if activeTool === "entity"}
-              <form class="tool-form" on:submit|preventDefault={runEntity}>
-                <div class="tool-heading">
-                  <div><span class="tool-kicker">GET /v1/entity/:id</span><h3>Look up a DBpedia entity</h3></div>
-                  <span class:state-origin={entitySource === "origin"} class:state-cache={entitySource === "cache"} class:state-stale={entitySource === "stale"} class:state-error={entitySource === "error"} class:state-loading={entitySource === "loading"} class="source-badge">{sourceLabel(entitySource)}</span>
-                </div>
-                <label class="field wide-field"><span>Entity ID</span><input bind:value={entityId} autocomplete="off" placeholder="Albert_Einstein" /></label>
-                <div class="field-row">
-                  <label class="field"><span>Endpoint</span><select bind:value={entityEndpoint}>{#each endpointOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
-                  <label class="field"><span>Language</span><select bind:value={entityLanguage}>{#each languageOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
-                </div>
-                <div class="form-footer"><span class="field-hint">Cache keys include endpoint + language.</span><button class="run-button" type="submit" disabled={entityLoading}>{entityLoading ? "Running..." : "Run lookup"} <span>↗</span></button></div>
-              </form>
-            {:else if activeTool === "search"}
-              <form class="tool-form" on:submit|preventDefault={runSearch}>
-                <div class="tool-heading">
-                  <div><span class="tool-kicker">GET /v1/search</span><h3>Search across DBpedia</h3></div>
-                  <span class:state-origin={searchSource === "origin"} class:state-cache={searchSource === "cache"} class:state-stale={searchSource === "stale"} class:state-error={searchSource === "error"} class:state-loading={searchSource === "loading"} class="source-badge">{sourceLabel(searchSource)}</span>
-                </div>
-                <label class="field wide-field"><span>Search query</span><input bind:value={searchQuery} autocomplete="off" placeholder="Ethiopia" /></label>
-                <div class="field-row">
-                  <label class="field"><span>Endpoint</span><select bind:value={searchEndpoint}>{#each endpointOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
-                  <label class="field"><span>Language</span><select bind:value={searchLanguage}>{#each languageOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
-                </div>
-                <div class="form-footer"><span class="field-hint">Language-aware routing stays DBpedia-only.</span><button class="run-button" type="submit" disabled={searchLoading}>{searchLoading ? "Running..." : "Run search"} <span>↗</span></button></div>
-              </form>
-            {:else}
-              <form class="tool-form" on:submit|preventDefault={runSparql}>
-                <div class="tool-heading">
-                  <div><span class="tool-kicker">POST /v1/sparql</span><h3>Send a raw SPARQL query</h3></div>
-                  <span class:state-origin={sparqlSource === "origin"} class:state-cache={sparqlSource === "cache"} class:state-stale={sparqlSource === "stale"} class:state-error={sparqlSource === "error"} class:state-loading={sparqlSource === "loading"} class="source-badge">{sourceLabel(sparqlSource)}</span>
-                </div>
-                <label class="field wide-field"><span>Endpoint</span><select bind:value={sparqlEndpoint}>{#each endpointOptions as option}<option value={option.value}>{option.label}</option>{/each}</select></label>
-                <label class="field wide-field"><span>SPARQL query</span><textarea bind:value={sparqlQuery} spellcheck="false" placeholder="SELECT * WHERE &#123; ?s ?p ?o &#125; LIMIT 5"></textarea></label>
-                <div class="form-footer"><span class="field-hint">Raw queries accept an optional DBpedia endpoint.</span><button class="run-button" type="submit" disabled={sparqlLoading}>{sparqlLoading ? "Running..." : "Run query"} <span>↗</span></button></div>
-              </form>
-            {/if}
-          </div>
-
-          <aside class="usage-panel">
-            <div class="usage-header"><span class="usage-symbol">✦</span><div><span class="tool-kicker">WHAT YOU'RE SEEING</span><h3>Read the response path</h3></div></div>
-            <div class="usage-step"><span class="step-dot cache-dot"></span><div><strong>Cache</strong><p>Fast repeat requests are served by Redis without touching DBpedia.</p></div></div>
-            <div class="usage-step"><span class="step-dot origin-dot"></span><div><strong>Origin</strong><p>A fresh lookup traveled through the bounded outbound gate.</p></div></div>
-            <div class="usage-step"><span class="step-dot stale-dot"></span><div><strong>Stale fallback</strong><p>If DBpedia is unavailable, a known response can keep the user moving.</p></div></div>
-            <div class="example-block"><span class="tool-kicker">QUICK EXAMPLES</span><div class="example-chips"><button type="button" on:click={() => chooseExample("entity", "Albert_Einstein")}>Albert Einstein</button><button type="button" on:click={() => chooseExample("search", "Ethiopia")}>Ethiopia</button><button type="button" on:click={() => chooseExample("sparql", "SELECT ?s WHERE { ?s a <http://dbpedia.org/ontology/City> } LIMIT 5")}>Cities</button></div></div>
-          </aside>
-        </div>
-      </section>
-
-      <section id="response" class="content-section response-section">
-        <div class="section-heading">
-          <div>
-            <div class="eyebrow">Transparent by design</div>
-            <h2>Response inspector</h2>
-          </div>
-          <div class="response-tools"><span class="response-size">{responseBytes.toLocaleString()} bytes</span><button class="copy-button" type="button" on:click={copyResponse}>{copyState} <span>⧉</span></button></div>
-        </div>
-        <div class="response-panel">
-          <div class="response-bar">
-            <div><span class:state-origin={responseSource === "origin"} class:state-cache={responseSource === "cache"} class:state-stale={responseSource === "stale"} class:state-error={responseSource === "error"} class="source-badge">{sourceLabel(responseSource)}</span><strong>{sourceTitle}</strong></div>
-            <span class="mono-label">JSON / RAW VIEW</span>
-          </div>
-          <pre>{responseText}</pre>
-        </div>
-      </section>
     </main>
 
     <footer class="workspace-footer">
-      <span>KGProxy / DBpedia reliability gateway</span>
-      <span>Cache · concurrency · circuit breaker · metrics</span>
+      <span>KGProxy / a clearer way to explore DBpedia</span>
+      <span>English · አማርኛ · Deutsch · Français</span>
     </footer>
   </div>
 </div>
