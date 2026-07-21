@@ -6,6 +6,9 @@ BUN_BIN="/home/ubuntu/.bun/bin/bun"
 BASE_URL="${DEPLOY_BASE_URL:-https://kgproxy.io}"
 DASHBOARD_URL="${DEPLOY_DASHBOARD_URL:-${BASE_URL}}"
 
+exec 9>/tmp/kgproxy-deploy.lock
+flock 9
+
 cd "${APP_DIR}"
 
 git switch main
