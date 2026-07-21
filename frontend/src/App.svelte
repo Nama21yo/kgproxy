@@ -456,8 +456,13 @@
   function chooseLanguage(language: string) {
     entityLanguage = language;
     searchLanguage = language;
-    entityEndpoint = "";
-    searchEndpoint = "";
+    const languageEndpoint: Record<string, string> = {
+      am: "https://am.dbpedia.data.dice-research.org/sparql",
+      de: "https://de.dbpedia.org/sparql",
+      fr: "https://fr.dbpedia.org/sparql"
+    };
+    entityEndpoint = languageEndpoint[language] ?? "";
+    searchEndpoint = languageEndpoint[language] ?? "";
     activeTool = "entity";
   }
 

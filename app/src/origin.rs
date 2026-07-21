@@ -124,7 +124,10 @@ pub fn entity_query(id: &str, lang: &str) -> String {
     let resource = format!("http://dbpedia.org/resource/{}", encode_resource_id(id));
 
     format!(
-        r#"SELECT ?label ?abstract ?property ?value WHERE {{
+        r#"PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX dbo: <http://dbpedia.org/ontology/>
+
+SELECT ?label ?abstract ?property ?value WHERE {{
   VALUES ?entity {{ <{resource}> }}
   OPTIONAL {{ ?entity rdfs:label ?label FILTER (lang(?label) = "{lang}") }}
   OPTIONAL {{ ?entity dbo:abstract ?abstract FILTER (lang(?abstract) = "{lang}") }}
@@ -142,7 +145,10 @@ pub fn search_query(label: &str, limit: u16, lang: &str) -> String {
     let bounded_limit = limit.clamp(1, 50);
 
     format!(
-        r#"SELECT ?entity ?label ?abstract WHERE {{
+        r#"PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX dbo: <http://dbpedia.org/ontology/>
+
+SELECT ?entity ?label ?abstract WHERE {{
   ?entity rdfs:label ?label .
   FILTER (lang(?label) = "{lang}")
   FILTER CONTAINS(LCASE(STR(?label)), LCASE("{escaped_label}"))
