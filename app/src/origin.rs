@@ -121,7 +121,12 @@ impl DbpediaClient for ReqwestDbpediaClient {
 }
 
 pub fn entity_query(id: &str, lang: &str) -> String {
-    let resource = format!("http://dbpedia.org/resource/{}", encode_resource_id(id));
+    let resource_host = if lang == "am" {
+        "am.dbpedia.org"
+    } else {
+        "dbpedia.org"
+    };
+    let resource = format!("http://{resource_host}/resource/{}", encode_resource_id(id));
 
     format!(
         r#"PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -232,5 +237,13 @@ mod tests {
         assert!(entity.contains("lang(?abstract) = \"de\""));
         assert!(search.contains("lang(?label) = \"fr\""));
         assert!(search.contains("lang(?abstract) = \"fr\""));
+    }
+
+    #[test]
+    fn amharic_entity_lookup_uses_amharic_resource_namespace() {
+        let query = entity_query("ዳኛቸው_ወርቁ", "am");
+
+        assert!(query.contains("<http://am.dbpedia.org/resource/%E1%8B%B3%E1%8A%9B%E1%89%B8%E1%8B%8D_%E1%8B%88%E1%88%AD%E1%89%81>"));
+        assert!(query.contains("FILTER (lang(?label) = \"am\")"));
     }
 }
