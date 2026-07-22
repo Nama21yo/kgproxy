@@ -568,7 +568,8 @@ fn validate_language(language: Option<String>) -> Result<String, ApiError> {
 }
 
 fn cache_params<'a>(endpoint_override: Option<&'a str>, lang: &'a str) -> Vec<(&'a str, &'a str)> {
-    let mut params = vec![("lang", lang)];
+    const QUERY_CACHE_VERSION: &str = "2";
+    let mut params = vec![("lang", lang), ("query_version", QUERY_CACHE_VERSION)];
     if let Some(endpoint) = endpoint_override {
         params.push(("endpoint", endpoint));
     }
