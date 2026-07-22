@@ -53,6 +53,7 @@ fn normalize_sparql_whitespace(query: &str) -> String {
 
 fn digest_parts<const N: usize>(parts: [&str; N]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(b"kgproxy-cache-v2");
 
     for part in parts {
         hasher.update(part.len().to_be_bytes());
