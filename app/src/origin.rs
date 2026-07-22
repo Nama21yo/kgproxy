@@ -165,7 +165,24 @@ LIMIT {bounded_limit}"#,
 
 fn encode_resource_id(id: &str) -> String {
     id.split('/')
-        .map(|part| urlencoding::encode(part).into_owned())
+        .map(|part| {
+            part.chars()
+                .map(|character| match character {
+                    ' ' => "%20".to_owned(),
+                    '<' => "%3C".to_owned(),
+                    '>' => "%3E".to_owned(),
+                    '"' => "%22".to_owned(),
+                    '\\' => "%5C".to_owned(),
+                    '#' => "%23".to_owned(),
+                    '?' => "%3F".to_owned(),
+                    '%' => "%25".to_owned(),
+                    character => character.to_string(),
+                })
+                .fold(String::new(), |mut encoded, character| {
+                    encoded.push_str(&character);
+                    encoded
+                })
+        })
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -243,7 +260,7 @@ mod tests {
     fn amharic_entity_lookup_uses_amharic_resource_namespace() {
         let query = entity_query("ዳኛቸው_ወርቁ", "am");
 
-        assert!(query.contains("<http://am.dbpedia.org/resource/%E1%8B%B3%E1%8A%9B%E1%89%B8%E1%8B%8D_%E1%8B%88%E1%88%AD%E1%89%81>"));
+        assert!(query.contains("<http://am.dbpedia.org/resource/ዳኛቸው_ወርቁ>"));
         assert!(query.contains("FILTER (lang(?label) = \"am\")"));
     }
 }
